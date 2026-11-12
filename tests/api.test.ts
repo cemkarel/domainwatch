@@ -22,6 +22,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0006_webhook_key_deploy_lock.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0007_retry_tls_certificate_checks.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0008_retry_tls_dns_status.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0009_retry_pending_checks.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -51,6 +52,8 @@ function fixture() {
     LOGIN_LIMIT: { limit }, WRITE_LIMIT: { limit }, TEST_LIMIT: { limit }
   } as unknown as Env;
   const baseUrl = 'https://domainwatch.example';
+  const pending: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { pending.push(task); } } as ExecutionContext;
   let sessionCookie = '';
   function request(path: string, method = 'GET', data?: unknown, origin: string | null = baseUrl, cookie = sessionCookie) {
     const headers = new Headers({ 'Content-Type': 'application/json' });
@@ -59,7 +62,7 @@ function fixture() {
     return worker.fetch(new Request(baseUrl + '/api' + path, {
       method, headers,
       body: data === undefined ? undefined : JSON.stringify(data)
-    }), env);
+    }), env, ctx);
   }
   async function login(password = initialPassword) {
     const response = await request('/auth/login', 'POST', { username: 'admin', password });
@@ -70,7 +73,7 @@ function fixture() {
     sql.prepare("INSERT INTO users VALUES ('12345', 'legacy')").run();
     sql.prepare("INSERT INTO targets (id,user_id,hostname,domain) VALUES ('legacy-id','12345','example.org','example.org')").run();
   }
-  return { sql, env, request, login, seedLegacyTarget };
+  return { sql, env, request, login, seedLegacyTarget, completeChecks: () => Promise.all(pending.splice(0)) };
 }
 
 const webhook = 'https://hooks.slack.com/services/TTEST/BTEST/0123456789abcdef';
@@ -134,6 +137,7 @@ test('The admin API tests unsaved Slack URLs and only returns decrypted settings
   assert.equal((await f.request('/targets', 'POST', { hostname: 'example.com' }, null)).status, 403);
   const created = await f.request('/targets', 'POST', { hostname: 'api.example.com' });
   assert.equal(created.status, 201);
+  await f.completeChecks();
   const { id } = await created.json() as { id: string };
   const targets = await (await f.request('/targets')).json() as { id: string }[];
   assert.deepEqual(targets.map(target => target.id), [id]);
@@ -156,9 +160,15 @@ test('The admin API tests unsaved Slack URLs and only returns decrypted settings
   assert.equal((await f.request('/settings/slack/test', 'POST')).status, 200);
 });
 
-test('Adding a target saves its first RDAP and TLS results and queues alerts before returning', async t => {
+test('Adding a target returns before TLS and publishes RDAP while the TLS check is still running', async t => {
   const f = fixture();
-  t.after(() => f.sql.close());
+  let releaseTls!: () => void;
+  const tlsGate = new Promise<void>(resolve => { releaseTls = resolve; });
+  t.after(async () => {
+    releaseTls();
+    await f.completeChecks();
+    f.sql.close();
+  });
   assert.equal((await f.login()).status, 200);
   f.env.TLS_BROWSER = { fetch } as Env['TLS_BROWSER'];
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
@@ -185,6 +195,7 @@ test('Adding a target saves its first RDAP and TLS results and queues alerts bef
     },
     async goto(url: string) {
       assert.equal(url, 'https://api.example.com/');
+      await tlsGate;
       const send = t.mock.fn(async (overrides?: { method: string }) => overrides?.method);
       await onRequest({
         url: () => url,
@@ -227,7 +238,13 @@ test('Adding a target saves its first RDAP and TLS results and queues alerts bef
   const response = await f.request('/targets', 'POST', { hostname: 'api.example.com' });
   assert.equal(response.status, 201);
   const { id, checked } = await response.json() as { id: string; checked: boolean };
-  assert.equal(checked, true);
+  assert.equal(checked, false);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const partial = f.sql.prepare('SELECT domain_expiry,tls_status FROM targets WHERE id=?').get(id);
+  assert.equal(partial?.domain_expiry, domainExpiry);
+  assert.equal(partial?.tls_status, 'pending');
+  releaseTls();
+  await f.completeChecks();
   const targets = await (await f.request('/targets')).json() as Record<string, unknown>[];
   assert.equal(targets[0].id, id);
   assert.equal(targets[0].domain_expiry, domainExpiry);

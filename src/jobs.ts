@@ -1,5 +1,5 @@
 import { day, decryptWebhook, dueThreshold } from './core.ts';
-import { checkDomain, rdapBootstrap } from './checks.ts';
+import { checkDomain, rdapBootstrap, type Check } from './checks.ts';
 import { workspaceOwnerId, type Env } from './env.ts';
 import { sendSlack } from './network.ts';
 import { tlsChecks } from './tls.ts';
@@ -28,6 +28,17 @@ const targetQuery = `
   FROM targets t LEFT JOIN notifications n USING(user_id)
 `;
 
+async function settleWithin<T>(operation: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([operation, new Promise<T>(resolve => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function checkTarget(
   env: Env, target: Target, checkTls: ReturnType<typeof tlsChecks>['check'], loadBootstrap = rdapBootstrap
 ) {
@@ -37,15 +48,21 @@ async function checkTarget(
     .bind(now + 10 * 60_000, lease, target.id, now).run();
   if (!claim.meta.changes) return false;
 
+  const domainCheck = settleWithin<Check>(loadBootstrap().then(bootstrap => checkDomain(target.domain, bootstrap)),
+    20_000, { status: 'rdap_error', expiry: null }).then(async result => {
+    await env.DB.prepare('UPDATE targets SET domain_status=?, domain_expiry=? WHERE id=? AND lease=?')
+      .bind(result.status, result.expiry, target.id, lease).run();
+    return result;
+  });
   const [domain, tls] = await Promise.all([
-    loadBootstrap().then(bootstrap => checkDomain(target.domain, bootstrap)),
-    checkTls(target.hostname)
+    domainCheck,
+    settleWithin<Check>(checkTls(target.hostname), 18_000, { status: 'scanner_timeout', expiry: null })
   ]);
   const checked = Date.now();
   const statements = [
-    env.DB.prepare(`UPDATE targets SET domain_status=?, domain_expiry=?, tls_status=?, tls_expiry=?,
+    env.DB.prepare(`UPDATE targets SET tls_status=?, tls_expiry=?,
       checked_at=?, next_check=?, lease=NULL WHERE id=? AND lease=?`)
-      .bind(domain.status, domain.expiry, tls.status, tls.expiry, checked, checked + day, target.id, lease)
+      .bind(tls.status, tls.expiry, checked, checked + day, target.id, lease)
   ];
 
   if (target.enabled && target.thresholds && target.version) {
@@ -81,7 +98,7 @@ export async function checkNewTarget(env: Env, id: string) {
   try {
     return await checkTarget(env, target, tls.check);
   } finally {
-    await tls.close();
+    await settleWithin(tls.close(), 2000, undefined);
   }
 }
 
@@ -97,7 +114,7 @@ async function checks(env: Env, now: number) {
       await checkTarget(env, target, tls.check, loadBootstrap);
     }
   } finally {
-    await tls.close();
+    await settleWithin(tls.close(), 2000, undefined);
   }
 }
 

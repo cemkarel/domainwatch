@@ -57,11 +57,10 @@ api.post('/targets', async c => {
       .bind(user, host.hostname).first();
     return c.json({ error: duplicate ? 'duplicate_hostname' : 'target_limit' }, 409);
   }
-  const checked = await checkNewTarget(c.env, id).catch(() => {
+  c.executionCtx.waitUntil(checkNewTarget(c.env, id).catch(() => {
     console.error({ event: 'first_check_failed', targetId: id });
-    return false;
-  });
-  return c.json({ id, checked }, 201);
+  }));
+  return c.json({ id, checked: false }, 201);
 });
 
 api.delete('/targets/:id', async c => {

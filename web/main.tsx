@@ -15,7 +15,7 @@ interface Alert {
 
 const languageKey = 'domainwatch-language';
 
-type Notice = { message: 'adding' | 'added' | 'addedPending' | 'slackSaved' | 'testSent' | 'passwordChanged' } | { error: string };
+type Notice = { message: 'addedPending' | 'slackSaved' | 'testSent' | 'passwordChanged' } | { error: string };
 
 function initialLanguage(): Language {
   try {
@@ -191,6 +191,8 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const loadTargets = async () => setTargets(await api<Target[]>('/targets'));
   const loadAlerts = async () => setAlerts(await api<Alert[]>('/alerts'));
   const loadSettings = async () => setSettings(await api<Settings>('/settings/slack'));
+  const checksPending = page === 'targets' &&
+    targets.some(target => target.domain_status === 'pending' || target.tls_status === 'pending');
 
   useEffect(() => {
     const load = page === 'targets' ? loadTargets : page === 'settings' ? loadSettings : loadAlerts;
@@ -198,6 +200,16 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     const interval = page === 'settings' ? undefined : setInterval(() => void load().catch(showError), 30_000);
     return () => clearInterval(interval);
   }, [page]);
+
+  useEffect(() => {
+    if (!checksPending) return;
+    const interval = setInterval(() => void loadTargets().catch(showError), 2500);
+    const stop = setTimeout(() => clearInterval(interval), 25_000);
+    return () => {
+      clearInterval(interval);
+      clearTimeout(stop);
+    };
+  }, [checksPending]);
 
   async function run(action: () => Promise<void>) {
     if (busy) return;
@@ -209,11 +221,10 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   function add(event: FormEvent) {
     event.preventDefault();
     void run(async () => {
-      setNotice({ message: 'adding' });
-      const { checked } = await api<{ checked: boolean }>('/targets', 'POST', { hostname: host });
+      await api('/targets', 'POST', { hostname: host });
       setHost('');
       await loadTargets();
-      setNotice({ message: checked ? 'added' : 'addedPending' });
+      setNotice({ message: 'addedPending' });
     });
   }
 

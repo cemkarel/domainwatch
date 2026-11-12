@@ -122,20 +122,9 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
   }
 }
 
-async function launchBrowser(binding: BrowserWorker, hostnames: string[]) {
-  const options = { guardrails: { allowedDomains: [...new Set(hostnames)] } };
-  try {
-    return await puppeteer.launch(binding, options);
-  } catch (error) {
-    // The Free plan permits one new session every 20 seconds.
-    if (!(error instanceof Error) || !/code: 429:/.test(error.message) || /time limit/i.test(error.message)) throw error;
-    await new Promise(resolve => setTimeout(resolve, 20_000));
-    return puppeteer.launch(binding, options);
-  }
-}
-
 export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[]) {
   let browser: Promise<Browser> | undefined;
+  let closed = false;
   return {
     async check(hostname: string): Promise<Check> {
       if (!binding) return { status: 'scanner_unconfigured', expiry: null };
@@ -148,8 +137,11 @@ export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[
           return { status: 'no_public_address', expiry: null };
         }
 
-        browser ??= launchBrowser(binding, hostnames);
-        const page = await (await browser).newPage();
+        if (closed) return { status: 'scanner_error', expiry: null };
+        browser ??= puppeteer.launch(binding, { guardrails: { allowedDomains: [...new Set(hostnames)] } });
+        const session = await browser;
+        if (closed) return { status: 'scanner_error', expiry: null };
+        const page = await session.newPage();
         try {
           return await scanPage(page, hostname);
         } finally {
@@ -162,6 +154,7 @@ export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[
       }
     },
     async close() {
+      closed = true;
       if (browser) await browser.then(session => session.close()).catch(() => {});
     }
   };
