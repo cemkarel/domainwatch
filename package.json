@@ -7,7 +7,8 @@
   "scripts": {
     "build": "vite build",
     "dev": "npm run build && wrangler dev --test-scheduled",
-    "deploy": "npm run build && wrangler deploy",
+    "deploy": "npm run build && npm run deploy:cloudflare",
+    "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
     "types": "wrangler types --env-interface WorkerBindings",
     "typecheck": "npm run types && tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",

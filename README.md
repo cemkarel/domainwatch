@@ -45,26 +45,29 @@ Worker'ın `.dev.vars` dosyasına aynı `SCANNER_TOKEN` değerini ve `SCANNER_UR
 
 Webhook URL'si D1'e AES-256-GCM ile ve kullanıcı kimliğine bağlı olarak şifreli yazılır. Ayar yanıtı sabit bir maske döndürür. Boş webhook alanıyla kaydetmek mevcut değeri korur. Anahtarı değiştirirseniz kullanıcıların webhook adreslerini yeniden kaydetmesi gerekir. Kimlik doğrulama GitHub OAuth state, PKCE ve D1'de hash olarak tutulan yedi günlük HTTP-only oturumla çalışır. Yazma istekleri aynı origin'den gelmelidir. [GitHub OAuth akışı](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps)
 
-## Cloudflare'a dağıtım
+## GitHub üzerinden Cloudflare'a dağıtım
 
-1. `npx wrangler login` ile doğru Cloudflare hesabına giriş yapın.
-2. `npx wrangler d1 create domainwatch` çıktısındaki `database_id` değerini `wrangler.jsonc` içindeki örnek kimlikle değiştirin. Oradaki üç rate-limit namespace kimliği hesabınızda başka bir uygulamaya aitse benzersiz kimlikler verin.
-3. Canlı GitHub OAuth App oluşturun. Homepage URL için Worker'ın HTTPS origin'ini, callback için aynı origin altında `/auth/github/callback` yolunu girin. Yerel OAuth App'i ayrı tutun.
-4. Canlı TLS takibi için HTTPS tarayıcısını kurun. `SCANNER_URL` tam `/check` adresi, `SCANNER_TOKEN` tarayıcıyla ortak rastgele anahtar olmalı.
-5. D1 migrasyonunu uygulayın ve Worker'ı dağıtın.
+Bu dağıtım dosyalarını GitHub'daki `main` dalına gönderin. Cloudflare'da **Workers & Pages → Create application → Import a repository** yolundan bağlı GitHub hesabını seçin ve aşağıdaki ayarlarla Worker'ı oluşturun.
 
-```sh
-npx wrangler d1 migrations apply domainwatch --remote
-npm run deploy
-npx wrangler secret put APP_ORIGIN
-npx wrangler secret put GITHUB_CLIENT_ID
-npx wrangler secret put GITHUB_CLIENT_SECRET
-npx wrangler secret put WEBHOOK_KEY
-npx wrangler secret put SCANNER_URL
-npx wrangler secret put SCANNER_TOKEN
-```
+| Ayar | Değer |
+| --- | --- |
+| Repo / üretim dalı | `ersinkirbulut/domainwatch` / `main` |
+| Worker name | `domainwatch` |
+| Root directory | `/` |
+| Build command | `npm run build` |
+| Deploy command | `npm run deploy:cloudflare` |
 
-`APP_ORIGIN` bir path veya sonda slash içermeyen HTTPS origin olmalıdır. Scanner secret'ları yalnız TLS tarayıcısı kullanılıyorsa gereklidir. Uygulamada test mesajı denemek için kullanıcıya ait geçerli bir Slack webhook adresi gerekir.
+Build token'ında Worker'ın bağlı olduğu hesap için **Workers Scripts Edit** ve **D1 Edit** izinleri bulunmalıdır. Cloudflare'ın oluşturduğu varsayılan token'a **My Profile → API Tokens** üzerinden D1 Edit ekleyin. İlk build izin hatası alırsa token'ı güncelledikten sonra build'i yeniden çalıştırın. [Workers Builds token izinleri](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/#api-token)
+
+Deploy komutu, build'in çalıştığı hesapta `domainwatch` adlı D1 veritabanını bulur veya oluşturur, bekleyen migrasyonları uygular ve Worker'ı yayınlar. Repo herhangi bir hesaba veya D1 UUID'sine bağlı değildir. Herhangi bir adım başarısız olursa sonraki adım çalışmaz. Aynı akışı terminalden çalıştırmak için doğru hesapta `npx wrangler login` yapın, ardından `npm ci` ve `npm run deploy` çalıştırın.
+
+İlk deploy sonrası **Settings → Variables and Secrets** bölümünde şu değerleri girin:
+
+- `APP_ORIGIN` için Worker'ın HTTPS adresini kullanın. Sonda slash olmamalı.
+- GitHub'da bir OAuth App oluşturup `GITHUB_CLIENT_ID` ve `GITHUB_CLIENT_SECRET` değerlerini ekleyin. Callback adresi `APP_ORIGIN` + `/auth/github/callback` olmalı.
+- `WEBHOOK_KEY` değerini secret olarak ekleyin. D1'de şifreli Slack ayarları varsa önceki anahtarı kullanın. Yeni kurulumda `openssl rand -base64 32` ile anahtar oluşturun.
+
+**TLS izlemesini etkinleştirmek için** bu repodaki Node tarayıcısı ayrı bir ağ ortamında çalışmalıdır. `SCANNER_URL` o servisin HTTPS `/check` adresidir. `SCANNER_TOKEN` sizin ürettiğiniz rastgele anahtardır ve Worker ile Node servisine aynı değer girilir. Bu iki ayar yalnızca sertifika izlemesini etkinleştirir. GitHub dağıtımı, RDAP ve Slack alan adı bildirimleri bunlar olmadan çalışır.
 
 ## Kontrol ve bildirim davranışı
 
