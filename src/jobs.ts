@@ -5,7 +5,6 @@ import { sendSlack } from './network.ts';
 
 interface Target {
   id: string;
-  user_id: string;
   hostname: string;
   domain: string;
   enabled: number | null;
@@ -23,51 +22,68 @@ interface Alert {
   user_id: string;
 }
 
+const targetQuery = `
+  SELECT t.id, t.hostname, t.domain, n.enabled, n.thresholds, n.version
+  FROM targets t LEFT JOIN notifications n USING(user_id)
+`;
+
+async function checkTarget(env: Env, target: Target, loadBootstrap = rdapBootstrap) {
+  const now = Date.now();
+  const lease = crypto.randomUUID();
+  const claim = await env.DB.prepare('UPDATE targets SET next_check=?, lease=? WHERE id=? AND next_check<=?')
+    .bind(now + 10 * 60_000, lease, target.id, now).run();
+  if (!claim.meta.changes) return false;
+
+  const [domain, tls] = await Promise.all([
+    loadBootstrap().then(bootstrap => checkDomain(target.domain, bootstrap)),
+    checkTls(target.hostname, env)
+  ]);
+  const checked = Date.now();
+  const statements = [
+    env.DB.prepare(`UPDATE targets SET domain_status=?, domain_expiry=?, tls_status=?, tls_expiry=?,
+      checked_at=?, next_check=?, lease=NULL WHERE id=? AND lease=?`)
+      .bind(domain.status, domain.expiry, tls.status, tls.expiry, checked, checked + day, target.id, lease)
+  ];
+
+  if (target.enabled && target.thresholds && target.version) {
+    const values = JSON.parse(target.thresholds) as number[];
+    for (const [kind, check] of [['domain', domain], ['tls', tls]] as const) {
+      if (!check.expiry) continue;
+      const threshold = dueThreshold(check.expiry, values, checked);
+      if (!threshold) continue;
+      const id = crypto.randomUUID();
+      statements.push(env.DB.prepare(`
+        INSERT INTO alerts (id,target_id,kind,expiry,threshold,settings_version,next_attempt,updated_at)
+        SELECT ?,t.id,?,?,?,?,?,? FROM targets t JOIN notifications n USING(user_id)
+        WHERE t.id=? AND t.checked_at=? AND n.enabled=1 AND n.version=?
+        ON CONFLICT(target_id,kind,expiry,threshold) DO UPDATE SET settings_version=excluded.settings_version,
+          state='pending', attempts=0, next_attempt=excluded.next_attempt, updated_at=excluded.updated_at,
+          last_result=NULL, claim=NULL
+        WHERE alerts.state!='sent' AND alerts.settings_version!=excluded.settings_version
+      `).bind(id, kind, check.expiry, threshold, target.version, checked, checked, target.id, checked, target.version));
+    }
+  }
+
+  const [updated] = await env.DB.batch(statements);
+  if (!updated.meta.changes) return false;
+  console.log({ event: 'target_checked', targetId: target.id, domain: domain.status, tls: tls.status });
+  return true;
+}
+
+export async function checkNewTarget(env: Env, id: string) {
+  const target = await env.DB.prepare(targetQuery + ' WHERE t.id=? AND t.user_id=?')
+    .bind(id, workspaceOwnerId(env)).first<Target>();
+  return target ? checkTarget(env, target) : false;
+}
+
 async function checks(env: Env, now: number) {
-  const { results } = await env.DB.prepare(`
-    SELECT t.id, t.user_id, t.hostname, t.domain, n.enabled, n.thresholds, n.version
-    FROM targets t LEFT JOIN notifications n USING(user_id)
+  const { results } = await env.DB.prepare(targetQuery + `
     WHERE t.user_id=? AND t.next_check<=? ORDER BY t.next_check, t.id LIMIT 2
   `).bind(workspaceOwnerId(env), now).all<Target>();
-  if (!results.length) return;
-  const bootstrap = await rdapBootstrap();
+  let bootstrap: ReturnType<typeof rdapBootstrap> | undefined;
+  const loadBootstrap = () => bootstrap ??= rdapBootstrap();
   for (const target of results) {
-    const lease = crypto.randomUUID();
-    const claim = await env.DB.prepare('UPDATE targets SET next_check=?, lease=? WHERE id=? AND next_check<=?')
-      .bind(now + 10 * 60_000, lease, target.id, now).run();
-    if (!claim.meta.changes) continue;
-
-    const [domain, tls] = await Promise.all([
-      checkDomain(target.domain, bootstrap), checkTls(target.hostname, env)
-    ]);
-    const checked = Date.now();
-    const statements = [
-      env.DB.prepare(`UPDATE targets SET domain_status=?, domain_expiry=?, tls_status=?, tls_expiry=?,
-        checked_at=?, next_check=?, lease=NULL WHERE id=? AND lease=?`)
-        .bind(domain.status, domain.expiry, tls.status, tls.expiry, checked, now + day, target.id, lease)
-    ];
-
-    if (target.enabled && target.thresholds && target.version) {
-      const values = JSON.parse(target.thresholds) as number[];
-      for (const [kind, check] of [['domain', domain], ['tls', tls]] as const) {
-        if (!check.expiry) continue;
-        const threshold = dueThreshold(check.expiry, values, checked);
-        if (!threshold) continue;
-        const id = crypto.randomUUID();
-        statements.push(env.DB.prepare(`
-          INSERT INTO alerts (id,target_id,kind,expiry,threshold,settings_version,next_attempt,updated_at)
-          SELECT ?,t.id,?,?,?,?,?,? FROM targets t JOIN notifications n USING(user_id)
-          WHERE t.id=? AND t.checked_at=? AND n.enabled=1 AND n.version=?
-          ON CONFLICT(target_id,kind,expiry,threshold) DO UPDATE SET settings_version=excluded.settings_version,
-            state='pending', attempts=0, next_attempt=excluded.next_attempt, updated_at=excluded.updated_at,
-            last_result=NULL, claim=NULL
-          WHERE alerts.state!='sent' AND alerts.settings_version!=excluded.settings_version
-        `).bind(id, kind, check.expiry, threshold, target.version, checked, checked, target.id, checked, target.version));
-      }
-    }
-
-    await env.DB.batch(statements);
-    console.log({ event: 'target_checked', targetId: target.id, domain: domain.status, tls: tls.status });
+    await checkTarget(env, target, loadBootstrap);
   }
 }
 

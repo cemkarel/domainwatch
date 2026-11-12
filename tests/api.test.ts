@@ -7,10 +7,13 @@ import { day, encryptWebhook } from '../src/core.ts';
 import type { Env } from '../src/env.ts';
 import { scheduled } from '../src/jobs.ts';
 
+const initialPassword = 'test-only-admin-password';
+
 function fixture() {
   const sql = new DatabaseSync(':memory:');
   sql.exec(readFileSync(new URL('../migrations/0001_init.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0002_shared_workspace.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0003_admin_auth.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -35,31 +38,87 @@ function fixture() {
         }
       }
     },
+    ADMIN_PASSWORD: initialPassword,
     WEBHOOK_KEY: btoa('a'.repeat(32)),
-    WRITE_LIMIT: { limit }, TEST_LIMIT: { limit }
+    LOGIN_LIMIT: { limit }, WRITE_LIMIT: { limit }, TEST_LIMIT: { limit }
   } as unknown as Env;
   const baseUrl = 'https://domainwatch.example';
-  function request(path: string, method = 'GET', data?: unknown, origin: string | null = baseUrl) {
+  let sessionCookie = '';
+  function request(path: string, method = 'GET', data?: unknown, origin: string | null = baseUrl, cookie = sessionCookie) {
     const headers = new Headers({ 'Content-Type': 'application/json' });
     if (origin !== null) headers.set('Origin', origin);
+    if (cookie) headers.set('Cookie', cookie);
     return worker.fetch(new Request(baseUrl + '/api' + path, {
       method, headers,
       body: data === undefined ? undefined : JSON.stringify(data)
     }), env);
   }
+  async function login(password = initialPassword) {
+    const response = await request('/auth/login', 'POST', { username: 'admin', password });
+    if (response.ok) sessionCookie = response.headers.get('Set-Cookie')!.split(';')[0];
+    return response;
+  }
   function seedLegacyTarget() {
     sql.prepare("INSERT INTO users VALUES ('12345', 'legacy')").run();
     sql.prepare("INSERT INTO targets (id,user_id,hostname,domain) VALUES ('legacy-id','12345','example.org','example.org')").run();
   }
-  return { sql, env, request, seedLegacyTarget };
+  return { sql, env, request, login, seedLegacyTarget };
 }
 
 const webhook = 'https://hooks.slack.com/services/TTEST/BTEST/0123456789abcdef';
 
-test('Public API uses a shared workspace, enforces same-origin mutations and masks encrypted settings', async t => {
+test('Admin login gates the API and password changes invalidate all existing sessions', async t => {
   const f = fixture();
   t.after(() => f.sql.close());
+  for (const path of ['/targets', '/settings/slack', '/alerts', '/auth/session']) {
+    assert.equal((await f.request(path)).status, 401);
+  }
+  assert.equal((await f.request('/auth/login', 'POST', { username: 'admin', password: initialPassword }, 'https://elsewhere.example')).status, 403);
+  assert.equal((await f.request('/auth/login', 'POST', { username: 'other', password: initialPassword })).status, 401);
+  f.env.ADMIN_PASSWORD = undefined;
+  assert.equal((await f.login()).status, 503);
+  f.env.ADMIN_PASSWORD = initialPassword;
+  assert.equal((await f.login('test-incorrect-password')).status, 401);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS count FROM admin_credentials').get()?.count, 0);
+
+  const login = await f.login();
+  assert.equal(login.status, 200);
+  const cookieHeader = login.headers.get('Set-Cookie')!;
+  assert.match(cookieHeader, /HttpOnly/i);
+  assert.match(cookieHeader, /Secure/i);
+  assert.match(cookieHeader, /SameSite=Strict/i);
+  const firstCookie = cookieHeader.split(';')[0];
+  assert.ok(!JSON.stringify(f.sql.prepare('SELECT * FROM admin_credentials').get()).includes(initialPassword));
+  assert.ok(!JSON.stringify(f.sql.prepare('SELECT * FROM admin_sessions').get()).includes(firstCookie.split('=')[1]));
+  assert.equal((await f.request('/auth/session')).status, 200);
+  assert.equal((await f.login()).status, 200);
+
+  const newPassword = 'test-only-replacement-password';
+  assert.equal((await f.request('/auth/password', 'PUT', { currentPassword: initialPassword, newPassword: 'short' })).status, 400);
+  assert.equal((await f.request('/auth/password', 'PUT', { currentPassword: newPassword, newPassword })).status, 400);
+  assert.equal((await f.request('/auth/password', 'PUT', { currentPassword: initialPassword, newPassword })).status, 200);
+  assert.equal((await f.request('/auth/session')).status, 401);
+  assert.equal((await f.request('/targets', 'GET', undefined, null, firstCookie)).status, 401);
+  assert.equal((await f.login()).status, 401);
+
+  f.env.ADMIN_PASSWORD = undefined;
+  assert.equal((await f.login(newPassword)).status, 200);
+  assert.equal((await f.request('/auth/logout', 'POST')).status, 200);
+  assert.equal((await f.request('/auth/session')).status, 401);
+});
+
+test('The admin API uses a shared workspace, enforces same-origin mutations and masks encrypted settings', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  assert.equal((await f.login()).status, 200);
   f.seedLegacyTarget();
+  t.mock.method(globalThis, 'fetch', async (url: string | URL, init: RequestInit) => {
+    if (url !== webhook) return new Response(null, { status: 503 });
+    assert.equal(init.method, 'POST');
+    assert.equal(init.redirect, 'manual');
+    assert.match(String(init.body), /Test message/);
+    return new Response('ok');
+  });
   const empty = await f.request('/targets', 'GET', undefined, null);
   assert.equal(empty.status, 200);
   assert.deepEqual(await empty.json(), []);
@@ -78,19 +137,53 @@ test('Public API uses a shared workspace, enforces same-origin mutations and mas
   assert.ok(settings.includes('••••') && !settings.includes(webhook));
   assert.ok(!JSON.stringify(f.sql.prepare('SELECT * FROM notifications').get()).includes(webhook));
 
-  t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
-    assert.equal(url, webhook);
-    assert.equal(init.method, 'POST');
-    assert.equal(init.redirect, 'manual');
-    assert.match(String(init.body), /Test message/);
-    return new Response('ok');
-  });
   assert.equal((await f.request('/settings/slack/test', 'POST')).status, 200);
+});
+
+test('Adding a target saves its first RDAP and TLS results and queues alerts before returning', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  assert.equal((await f.login()).status, 200);
+  f.env.SCANNER_URL = 'https://scanner.example.com/check';
+  f.env.SCANNER_TOKEN = 'test-only';
+  await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
+  const domainExpiry = new Date(Date.now() + 6 * day).toISOString();
+  const tlsExpiry = new Date(Date.now() + 3 * day).toISOString();
+  const fetchMock = t.mock.method(globalThis, 'fetch', async (url: string | URL, init: RequestInit) => {
+    if (url === 'https://data.iana.org/rdap/dns.json') {
+      return Response.json({ services: [[['com'], ['https://rdap.example.com/']]] });
+    }
+    if (String(url) === 'https://rdap.example.com/domain/example.com') {
+      return Response.json({ objectClassName: 'domain', events: [{ eventAction: 'expiration', eventDate: domainExpiry }] });
+    }
+    if (String(url) === f.env.SCANNER_URL) {
+      assert.equal(init.body, JSON.stringify({ hostname: 'api.example.com' }));
+      return Response.json({ hostname: 'api.example.com', status: 'ok', expiry: tlsExpiry });
+    }
+    throw new Error('Unexpected URL ' + url);
+  });
+
+  const response = await f.request('/targets', 'POST', { hostname: 'api.example.com' });
+  assert.equal(response.status, 201);
+  const { id, checked } = await response.json() as { id: string; checked: boolean };
+  assert.equal(checked, true);
+  const targets = await (await f.request('/targets')).json() as Record<string, unknown>[];
+  assert.equal(targets[0].id, id);
+  assert.equal(targets[0].domain_expiry, domainExpiry);
+  assert.equal(targets[0].tls_expiry, tlsExpiry);
+  const timing = f.sql.prepare('SELECT next_check - checked_at AS interval, lease FROM targets WHERE id=?').get(id);
+  assert.equal(timing?.interval, day);
+  assert.equal(timing?.lease, null);
+  const alerts = f.sql.prepare('SELECT kind FROM alerts WHERE target_id=? ORDER BY kind').all(id);
+  assert.deepEqual(alerts.map(alert => alert.kind), ['domain', 'tls']);
+  assert.equal((await f.request('/targets', 'POST', { hostname: 'api.example.com' })).status, 409);
+  assert.equal(fetchMock.mock.callCount(), 3);
 });
 
 test('A configured workspace owner reuses legacy targets and encrypted Slack settings', async t => {
   const f = fixture();
   t.after(() => f.sql.close());
+  assert.equal((await f.login()).status, 200);
   f.seedLegacyTarget();
   const encrypted = await encryptWebhook(webhook, f.env.WEBHOOK_KEY!, '12345');
   f.sql.prepare("INSERT INTO notifications VALUES ('12345', ?, 1, '[7]', 'legacy-version')").run(encrypted);
@@ -108,14 +201,17 @@ test('A configured workspace owner reuses legacy targets and encrypted Slack set
 test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack failures', async t => {
   const f = fixture();
   t.after(() => f.sql.close());
+  assert.equal((await f.login()).status, 200);
   f.seedLegacyTarget();
-  await f.request('/targets', 'POST', { hostname: 'api.example.com' });
+  f.sql.prepare("INSERT INTO targets (id,user_id,hostname,domain) VALUES ('pending-id','shared','api.example.com','example.com')").run();
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
   const expiry = new Date(Date.now() + 6 * day).toISOString();
   let slackRequests = 0;
+  let rdapRequests = 0;
   t.mock.method(globalThis, 'fetch', async (url: string | URL) => {
     if (String(url).includes('data.iana.org')) return Response.json({ services: [[['com'], ['https://rdap.example.com/']]] });
     if (String(url) === 'https://rdap.example.com/domain/example.com') {
+      rdapRequests++;
       return Response.json({ objectClassName: 'domain', events: [{ eventAction: 'expiration', eventDate: expiry }] });
     }
     if (url === webhook) return new Response('ok', { status: ++slackRequests === 1 ? 429 : 200 });
@@ -127,6 +223,8 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   assert.equal(target?.domain_expiry, expiry);
   assert.equal(target?.tls_status, 'scanner_unconfigured');
   assert.equal(f.sql.prepare("SELECT checked_at FROM targets WHERE id='legacy-id'").get()?.checked_at, null);
+  await scheduled(f.env);
+  assert.equal(rdapRequests, 1);
   for (let i = 0; i < 2; i++) {
     f.sql.exec('UPDATE targets SET next_check=0; UPDATE alerts SET next_attempt=0;');
     await scheduled(f.env);

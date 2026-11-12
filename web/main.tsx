@@ -1,5 +1,6 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
+import { label, slackHttpStatus, translations, type Copy, type Language } from './i18n.ts';
 import './style.css';
 
 interface Target {
@@ -12,29 +13,27 @@ interface Alert {
   attempts: number; last_result: string | null; updated_at: number;
 }
 
-const labels: Record<string, string> = {
-  pending: 'Sırada', ok: 'Kontrol edildi', unsupported: 'RDAP desteklenmiyor',
-  bootstrap_unavailable: 'RDAP listesi erişilemiyor', no_expiration: 'Sicil tarih paylaşmıyor',
-  not_found: 'Sicilde bulunamadı', rdap_error: 'RDAP sorgusu başarısız',
-  scanner_unconfigured: 'TLS tarayıcısı bağlı değil', scanner_error: 'TLS tarayıcısına erişilemedi',
-  scanner_configuration_error: 'TLS tarayıcısı ayarı geçersiz',
-  no_public_address: 'Genel IPv4 adresi bulunamadı', tls_unreachable: 'TLS bağlantısı kurulamadı',
-  tls_untrusted: 'Sertifika güvenilir değil', sent: 'Gönderildi', failed: 'Gönderilemedi'
-};
-const errors: Record<string, string> = {
-  invalid_hostname: 'example.com biçiminde bir alan adı veya alt alan adı girin.',
-  duplicate_hostname: 'Bu adres zaten listenizde.', target_limit: 'Takip sınırına ulaşıldı.',
-  invalid_webhook: 'Geçerli bir Slack Incoming Webhook adresi girin.',
-  invalid_origin: 'Bu adresten değişiklik yapılamıyor.',
-  webhook_required: 'Önce webhook adresini kaydedin.',
-  invalid_settings: 'En az bir bildirim eşiği seçin.',
-  settings_changed: 'Ayarlar başka bir oturumda değişti. Sayfayı yenileyin.',
-  encryption_unconfigured: 'Sunucuda webhook şifreleme anahtarı eksik.',
-  rate_limited: 'Çok fazla istek. Bir dakika sonra tekrar deneyin.'
-};
-const formatDate = (value: string | number) => new Intl.DateTimeFormat('tr-TR', {
-  dateStyle: 'medium', timeStyle: 'short'
-}).format(new Date(value));
+const languageKey = 'domainwatch-language';
+
+type Notice = { message: 'adding' | 'added' | 'addedPending' | 'slackSaved' | 'testSent' | 'passwordChanged' } | { error: string };
+
+function initialLanguage(): Language {
+  try {
+    return localStorage.getItem(languageKey) === 'en' ? 'en' : 'tr';
+  } catch {
+    return 'tr';
+  }
+}
+
+function errorMessage(code: string, copy: Copy) {
+  const status = slackHttpStatus(code);
+  return status ? copy.slackHttpError(status) : label(copy.errors, code) ?? copy.genericError;
+}
+
+function deliveryResult(code: string, copy: Copy) {
+  const status = slackHttpStatus(code);
+  return status ? `Slack HTTP ${status}` : label(copy.statuses, code) ?? label(copy.errors, code) ?? code;
+}
 
 class ApiError extends Error {
   constructor(public code: string) { super(code); }
@@ -52,20 +51,129 @@ async function api<T>(path: string, method = 'GET', data?: unknown): Promise<T> 
   return await response.json() as T;
 }
 
-function expiryView(status: string, expiry: string | null) {
-  if (!expiry) return <span className="muted">{labels[status] ?? status}</span>;
+function expiryView(status: string, expiry: string | null, copy: Copy, formatDate: (value: string) => string) {
+  const statusText = label(copy.statuses, status) ?? status;
+  if (!expiry) return <span className="muted">{statusText}</span>;
   const days = Math.ceil((Date.parse(expiry) - Date.now()) / 86_400_000);
   const expired = Date.parse(expiry) <= Date.now();
   return <div className="space-y-1">
     <div className="font-medium">{formatDate(expiry)}</div>
     <span className={'pill ' + (days <= 7 || status !== 'ok' ? 'warn' : '')}>
-      {expired ? 'Süresi doldu' : `${days} gün kaldı`}
+      {expired ? copy.expired : copy.daysLeft(days)}
     </span>
-    {status !== 'ok' && <div className="muted">{labels[status] ?? status}</div>}
+    {status !== 'ok' && <div className="muted">{statusText}</div>}
   </div>;
 }
 
+function NoticeView({ notice, copy }: { notice?: Notice; copy: Copy }) {
+  if (!notice) return null;
+  const isError = 'error' in notice;
+  return <p className={'notice ' + (isError ? 'warn' : '')} role={isError ? 'alert' : 'status'}>
+    {isError ? errorMessage(notice.error, copy) : copy[notice.message]}
+  </p>;
+}
+
+function errorCode(error: unknown) {
+  return error instanceof ApiError ? error.code : '';
+}
+
 function App() {
+  const [language, setLanguage] = useState<Language>(initialLanguage);
+  const copy = translations[language];
+  const [signedIn, setSignedIn] = useState<boolean>();
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<Notice>();
+
+  useEffect(() => {
+    document.documentElement.lang = language;
+    try {
+      localStorage.setItem(languageKey, language);
+    } catch {
+      // The current selection still works when storage is unavailable.
+    }
+  }, [language]);
+
+  useEffect(() => {
+    void api('/auth/session').then(() => setSignedIn(true)).catch(error => {
+      setSignedIn(false);
+      if (errorCode(error) !== 'unauthenticated') setNotice({ error: errorCode(error) });
+    });
+  }, []);
+
+  function signedOut(changed = false) {
+    setSignedIn(false);
+    setNotice(changed ? { message: 'passwordChanged' } : undefined);
+  }
+
+  async function login(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    setBusy(true);
+    setNotice(undefined);
+    try {
+      await api('/auth/login', 'POST', { username: data.get('username'), password: data.get('password') });
+      setSignedIn(true);
+    } catch (error) {
+      setNotice({ error: errorCode(error) });
+    } finally {
+      form.reset();
+      setBusy(false);
+    }
+  }
+
+  async function logout() {
+    setBusy(true);
+    setNotice(undefined);
+    try {
+      await api('/auth/logout', 'POST');
+      signedOut();
+    } catch (error) {
+      if (errorCode(error) === 'unauthenticated') signedOut();
+      else setNotice({ error: errorCode(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <>
+    <header className="topbar"><div className="shell flex items-center justify-between gap-3 py-4">
+      <Brand />
+      <div className="flex items-center gap-2">
+        <select className="quiet" aria-label={copy.language} value={language}
+          onChange={event => setLanguage(event.target.value === 'en' ? 'en' : 'tr')}>
+          <option value="tr" lang="tr">Türkçe</option>
+          <option value="en" lang="en">English</option>
+        </select>
+        {signedIn && <button className="quiet" disabled={busy} onClick={() => void logout()}>{copy.signOut}</button>}
+      </div>
+    </div></header>
+    {signedIn ? <>
+      {notice && <div className="shell"><NoticeView notice={notice} copy={copy} /></div>}
+      <Dashboard copy={copy} onSignOut={signedOut} />
+    </> : <main className="shell py-10">
+      {signedIn === undefined ? <p role="status" className="muted">{copy.checkingSession}</p> :
+        <form className="panel mx-auto max-w-sm space-y-5 p-6" onSubmit={login}>
+          <h1>{copy.signIn}</h1>
+          <NoticeView notice={notice} copy={copy} />
+          <label className="block">{copy.username}
+            <input name="username" defaultValue="admin" autoComplete="username" required maxLength={64} />
+          </label>
+          <label className="block">{copy.password}
+            <input name="password" type="password" autoComplete="current-password" required maxLength={128} />
+          </label>
+          <button className="button" disabled={busy}>{copy.signIn}</button>
+        </form>}
+    </main>}
+  </>;
+}
+
+function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: boolean) => void }) {
+  const dateFormat = useMemo(() => new Intl.DateTimeFormat(copy.locale, {
+    dateStyle: 'medium', timeStyle: 'short'
+  }), [copy.locale]);
+  const formatDate = (value: string | number) => dateFormat.format(new Date(value));
   const [targets, setTargets] = useState<Target[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [settings, setSettings] = useState<Settings>();
@@ -73,12 +181,11 @@ function App() {
   const [host, setHost] = useState('');
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<{ message: string; error?: boolean }>();
-
+  const [notice, setNotice] = useState<Notice>();
   function showError(error: unknown) {
-    const code = error instanceof ApiError ? error.code : '';
-    setNotice({ error: true, message: errors[code] ??
-      (code.startsWith('slack_') ? 'Slack teslimi başarısız (' + code + ').' : 'İşlem başarısız. Tekrar deneyin.') });
+    const code = errorCode(error);
+    if (code === 'unauthenticated') onSignOut();
+    else setNotice({ error: code });
   }
 
   const loadTargets = async () => setTargets(await api<Target[]>('/targets'));
@@ -102,10 +209,11 @@ function App() {
   function add(event: FormEvent) {
     event.preventDefault();
     void run(async () => {
-      await api('/targets', 'POST', { hostname: host });
+      setNotice({ message: 'adding' });
+      const { checked } = await api<{ checked: boolean }>('/targets', 'POST', { hostname: host });
       setHost('');
       await loadTargets();
-      setNotice({ message: 'Adres kontrol sırasına eklendi.' });
+      setNotice({ message: checked ? 'added' : 'addedPending' });
     });
   }
 
@@ -116,98 +224,128 @@ function App() {
       await api('/settings/slack', 'PUT', { url, enabled: settings.enabled, thresholds: settings.thresholds });
       setUrl('');
       await loadSettings();
-      setNotice({ message: 'Slack ayarları kaydedildi.' });
+      setNotice({ message: 'slackSaved' });
     });
   }
 
-  return <>
-    <header className="topbar"><div className="shell py-4">
-      <Brand />
-    </div></header>
-    <main className="shell py-10">
-      <nav className="tabs" aria-label="Ana menü">
-        {([['targets', 'Takip listesi'], ['settings', 'Ayarlar'], ['alerts', 'Bildirim geçmişi']] as const)
-          .map(([id, text]) => <button key={id} aria-current={page === id ? 'page' : undefined} onClick={() => {
+  function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    if (data.get('newPassword') !== data.get('confirmPassword')) {
+      setNotice({ error: 'password_mismatch' });
+      return;
+    }
+    void run(async () => {
+      await api('/auth/password', 'PUT', {
+        currentPassword: data.get('currentPassword'), newPassword: data.get('newPassword')
+      });
+      form.reset();
+      onSignOut(true);
+    });
+  }
+
+  return <main className="shell py-10">
+      <nav className="tabs" aria-label={copy.navigation}>
+        {(['targets', 'settings', 'alerts'] as const)
+          .map(id => <button key={id} aria-current={page === id ? 'page' : undefined} onClick={() => {
             setPage(id); setNotice(undefined);
-          }}>{text}</button>)}
+          }}>{copy[id]}</button>)}
       </nav>
-      {notice && <p className={'notice ' + (notice.error ? 'warn' : '')} role={notice.error ? 'alert' : 'status'}>{notice.message}</p>}
+      <NoticeView notice={notice} copy={copy} />
       {page === 'targets' && <>
         <div className="mt-8 mb-6 flex flex-wrap items-end justify-between gap-4">
-          <div><h1>Takip listesi</h1><p className="muted mt-2">Alan adı kaydı ve HTTPS sertifikası için günlük kontrol.</p></div>
-          <button className="quiet" disabled={busy} onClick={() => void run(loadTargets)}>Listeyi yenile</button>
+          <div><h1>{copy.targets}</h1><p className="muted mt-2">{copy.schedule}</p></div>
+          <button className="quiet" disabled={busy} onClick={() => void run(loadTargets)}>{copy.refresh}</button>
         </div>
         <form className="panel flex flex-wrap items-end gap-3 p-5" onSubmit={add}>
-          <label className="min-w-52 flex-1">Alan adı veya alt alan adı
+          <label className="min-w-52 flex-1">{copy.hostname}
             <input value={host} onChange={e => setHost(e.target.value)} placeholder="app.example.com" required maxLength={253} />
           </label>
-          <button className="button" disabled={busy}>Takibe ekle</button>
+          <button className="button" disabled={busy}>{copy.add}</button>
         </form>
-        <section className="panel mt-5 overflow-x-auto" aria-label="İzlenen adresler">
+        <section className="panel mt-5 overflow-x-auto" aria-label={copy.trackedAddresses}>
           {targets.length ? <table>
-            <thead><tr><th>Adres</th><th>Alan adı bitişi</th><th>TLS bitişi</th><th>Son kontrol</th><th>İşlem</th></tr></thead>
+            <thead><tr><th>{copy.address}</th><th>{copy.domainExpiry}</th><th>{copy.tlsExpiry}</th><th>{copy.lastCheck}</th><th>{copy.actions}</th></tr></thead>
             <tbody>{targets.map(target => <tr key={target.id}>
               <td><strong>{target.hostname}</strong>{target.hostname !== target.domain && <div className="muted">{target.domain}</div>}</td>
-              <td>{expiryView(target.domain_status, target.domain_expiry)}</td>
-              <td>{expiryView(target.tls_status, target.tls_expiry)}</td>
-              <td className="muted">{target.checked_at ? formatDate(target.checked_at) : 'Sırada'}</td>
-              <td><button className="quiet" disabled={busy} aria-label={target.hostname + ' takibini kaldır'}
-                onClick={() => { if (confirm(target.hostname + ' takip listesinden kaldırılsın mı?')) void run(async () => {
+              <td>{expiryView(target.domain_status, target.domain_expiry, copy, formatDate)}</td>
+              <td>{expiryView(target.tls_status, target.tls_expiry, copy, formatDate)}</td>
+              <td className="muted">{target.checked_at ? formatDate(target.checked_at) : copy.statuses.pending}</td>
+              <td><button className="quiet" disabled={busy} aria-label={copy.removeLabel(target.hostname)}
+                onClick={() => { if (confirm(copy.confirmRemoval(target.hostname))) void run(async () => {
                   await api('/targets/' + target.id, 'DELETE'); await loadTargets();
-                }); }}>Kaldır</button></td>
+                }); }}>{copy.remove}</button></td>
             </tr>)}</tbody>
-          </table> : <p className="muted p-8">Takibe başlamak için yukarıdan bir adres ekleyin.</p>}
+          </table> : <p className="muted p-8">{copy.emptyTargets}</p>}
         </section>
       </>}
       {page === 'settings' && <>
-        <h1 className="mt-8">Bildirim ayarları</h1>
+        <h1 className="mt-8">{copy.settings}</h1>
+        <form className="panel mt-6 max-w-2xl space-y-5 p-6" onSubmit={changePassword}>
+          <div>
+            <h2 className="text-xl font-semibold">{copy.changePassword}</h2>
+            <p className="muted mt-1">{copy.passwordRules}</p>
+          </div>
+          <input type="hidden" name="username" autoComplete="username" value="admin" />
+          <label className="block">{copy.currentPassword}
+            <input name="currentPassword" type="password" autoComplete="current-password" required maxLength={128} />
+          </label>
+          <label className="block">{copy.newPassword}
+            <input name="newPassword" type="password" autoComplete="new-password" required minLength={12} maxLength={128} />
+          </label>
+          <label className="block">{copy.confirmPassword}
+            <input name="confirmPassword" type="password" autoComplete="new-password" required minLength={12} maxLength={128} />
+          </label>
+          <button className="button" disabled={busy}>{copy.changePassword}</button>
+        </form>
         {settings && <form className="panel mt-6 max-w-2xl space-y-6 p-6" onSubmit={save}>
-          <div><h2 className="text-xl font-semibold">Slack</h2>
-            <p className="muted mt-1">Bitiş bildirimlerini Slack kanalınıza gönderin.</p></div>
-          <label>Incoming Webhook URL
+          <div><h2 className="text-xl font-semibold">{copy.notificationSettings} · Slack</h2>
+            <p className="muted mt-1">{copy.slackDescription}</p></div>
+          <label>{copy.webhook}
             <input type="password" autoComplete="off" maxLength={400} value={url}
               placeholder={settings.maskedUrl ?? 'https://hooks.slack.com/services/…'} onChange={e => setUrl(e.target.value)} />
           </label>
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={settings.enabled}
               onChange={e => setSettings({ ...settings, enabled: e.target.checked })} />
-            Slack bildirimlerini etkinleştir
+            {copy.enableSlack}
           </label>
           <fieldset>
-            <legend>Bildirim eşikleri</legend>
+            <legend>{copy.thresholds}</legend>
             <div className="mt-3 flex flex-wrap gap-2">{[30, 14, 7, 3, 1].map(days =>
               <label className="threshold" key={days}>
                 <input type="checkbox" checked={settings.thresholds.includes(days)} onChange={e =>
                   setSettings({ ...settings, thresholds: e.target.checked
                     ? [...settings.thresholds, days] : settings.thresholds.filter(day => day !== days) })} />
-                {days} gün
+                {copy.days(days)}
               </label>)}</div>
           </fieldset>
           <div className="flex flex-wrap gap-3">
-            <button className="button" disabled={busy}>Kaydet</button>
+            <button className="button" disabled={busy}>{copy.save}</button>
             <button type="button" className="quiet" disabled={busy || !settings.configured || Boolean(url)} onClick={() =>
               void run(async () => {
                 await api('/settings/slack/test', 'POST');
-                setNotice({ message: 'Slack test mesajı gönderildi.' });
-              })}>Test mesajı gönder</button>
+                setNotice({ message: 'testSent' });
+              })}>{copy.sendTest}</button>
           </div>
         </form>}
       </>}
       {page === 'alerts' && <>
-        <h1 className="mt-8">Bildirim geçmişi</h1>
+        <h1 className="mt-8">{copy.alerts}</h1>
         <section className="panel mt-6 overflow-x-auto">
           {alerts.length ? <table>
-            <thead><tr><th>Adres</th><th>Eşik</th><th>Durum</th><th>Deneme</th><th>Son işlem</th></tr></thead>
+            <thead><tr><th>{copy.address}</th><th>{copy.threshold}</th><th>{copy.status}</th><th>{copy.attempts}</th><th>{copy.lastUpdate}</th></tr></thead>
             <tbody>{alerts.map(alert => <tr key={alert.id}>
-              <td>{alert.hostname}</td><td>{alert.kind === 'tls' ? 'TLS' : 'Alan adı'} · {alert.threshold} gün</td>
-              <td>{labels[alert.state] ?? alert.state}<div className="muted">{alert.last_result}</div></td>
+              <td>{alert.hostname}</td><td>{alert.kind === 'tls' ? 'TLS' : copy.domain} · {copy.days(alert.threshold)}</td>
+              <td>{label(copy.statuses, alert.state) ?? alert.state}
+                {alert.last_result && <div className="muted">{deliveryResult(alert.last_result, copy)}</div>}</td>
               <td>{alert.attempts}</td><td>{formatDate(alert.updated_at)}</td>
             </tr>)}</tbody>
-          </table> : <p className="muted p-8">Henüz planlanan bir bildirim yok.</p>}
+          </table> : <p className="muted p-8">{copy.emptyAlerts}</p>}
         </section>
       </>}
-    </main>
-  </>;
+  </main>;
 }
 
 function Brand() {

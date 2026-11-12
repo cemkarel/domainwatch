@@ -1,12 +1,13 @@
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
+import { changePassword, login, logout, requireAdmin, type AdminApp } from './auth.ts';
 import { decryptWebhook, encryptWebhook, normalizeHost, parseThresholds, thresholds, webhookUrl } from './core.ts';
 import { workspaceOwnerId, type Env } from './env.ts';
-import { scheduled } from './jobs.ts';
+import { checkNewTarget, scheduled } from './jobs.ts';
 import { sendSlack } from './network.ts';
 
-const app = new Hono<{ Bindings: Env }>();
-const api = new Hono<{ Bindings: Env }>();
+const app = new Hono<AdminApp>();
+const api = new Hono<AdminApp>();
 app.use('*', async (c, next) => {
   await next();
   c.header('Cache-Control', 'no-store');
@@ -25,6 +26,11 @@ api.use('*', async (c, next) => {
   await next();
 });
 api.use('*', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'body_too_large' }, 413) }));
+api.post('/auth/login', login);
+api.use('*', requireAdmin);
+api.get('/auth/session', c => c.json({ ok: true }));
+api.post('/auth/logout', logout);
+api.put('/auth/password', changePassword);
 
 api.get('/targets', async c => {
   const { results } = await c.env.DB.prepare(`
@@ -51,7 +57,11 @@ api.post('/targets', async c => {
       .bind(user, host.hostname).first();
     return c.json({ error: duplicate ? 'duplicate_hostname' : 'target_limit' }, 409);
   }
-  return c.json({ id }, 201);
+  const checked = await checkNewTarget(c.env, id).catch(() => {
+    console.error({ event: 'first_check_failed', targetId: id });
+    return false;
+  });
+  return c.json({ id, checked }, 201);
 });
 
 api.delete('/targets/:id', async c => {
