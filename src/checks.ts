@@ -5,12 +5,6 @@ export interface Check {
   expiry: string | null;
 }
 
-export interface ScannerConfig {
-  SCANNER_URL?: string;
-  SCANNER_TOKEN?: string;
-  APP_ORIGIN?: string;
-}
-
 const fallback = new Map([
   ['com', 'https://rdap.verisign.com/com/v1/'],
   ['net', 'https://rdap.verisign.com/net/v1/'],
@@ -89,36 +83,4 @@ export async function checkDomain(domain: string, bootstrap: Map<string, string[
     }
   }
   return { status: noExpiry ? 'no_expiration' : notFound ? 'not_found' : 'rdap_error', expiry: null };
-}
-
-export async function checkTls(hostname: string, env: ScannerConfig): Promise<Check> {
-  if (!env.SCANNER_URL || !env.SCANNER_TOKEN) return { status: 'scanner_unconfigured', expiry: null };
-  try {
-    const url = new URL(env.SCANNER_URL);
-    const local = env.APP_ORIGIN === 'http://localhost:8787' &&
-      url.protocol === 'http:' && url.hostname === '127.0.0.1';
-    if ((!local && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash) {
-      return { status: 'scanner_configuration_error', expiry: null };
-    }
-    const response = await fetch(url, {
-      method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(10_000),
-      headers: { Authorization: 'Bearer ' + env.SCANNER_TOKEN, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hostname })
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      return { status: 'scanner_error', expiry: null };
-    }
-    const data = await boundedJson(response, 1024) as { hostname: string; status: string; expiry?: string };
-    if (data.hostname === hostname) {
-      const expiry = expiryDate(data.expiry);
-      if ((data.status === 'ok' || data.status === 'tls_untrusted') && expiry) return { status: data.status, expiry };
-      if (data.status === 'no_public_address' || data.status === 'tls_unreachable') {
-        return { status: data.status, expiry: null };
-      }
-    }
-  } catch {
-    // Report the configured adapter as unavailable.
-  }
-  return { status: 'scanner_error', expiry: null };
 }

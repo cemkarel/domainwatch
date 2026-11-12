@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { checkDomain, checkTls } from '../src/checks.ts';
+import { checkDomain } from '../src/checks.ts';
+import { tlsChecks } from '../src/tls.ts';
 
 test('RDAP distinguishes unsupported TLDs from bootstrap failures and tries a registry fallback', async t => {
   assert.deepEqual(await checkDomain('example.constructor', new Map()), { status: 'unsupported', expiry: null });
@@ -16,17 +17,14 @@ test('RDAP distinguishes unsupported TLDs from bootstrap failures and tries a re
   assert.deepEqual(called, ['https://rdap.example.com/domain/example.com', 'https://rdap.verisign.com/com/v1/domain/example.com']);
 });
 
-test('scanner adapter reports only the matching hostname and preserves untrusted certificate status', async t => {
-  const expiry = '2027-02-01T00:00:00.000Z';
-  let hostname = 'api.example.com';
-  t.mock.method(globalThis, 'fetch', async (url: URL, init: RequestInit) => {
-    assert.equal(url.href, 'https://scanner.example.com/check');
-    assert.equal(init.redirect, 'manual');
-    assert.deepEqual(JSON.parse(String(init.body)), { hostname: 'api.example.com' });
-    return Response.json({ hostname, status: 'tls_untrusted', expiry });
+test('TLS checks reject a host with non-public DNS answers before launching a browser', async t => {
+  t.mock.method(globalThis, 'fetch', async (url: URL) => {
+    assert.equal(url.hostname, 'cloudflare-dns.com');
+    assert.equal(url.searchParams.get('name'), 'api.example.com');
+    const ipv4 = url.searchParams.get('type') === 'A';
+    return Response.json({ Status: 0, Answer: [{ type: ipv4 ? 1 : 28, data: ipv4 ? '8.8.8.8' : '::1' }] });
   });
-  const config = { SCANNER_URL: 'https://scanner.example.com/check', SCANNER_TOKEN: 'test-only-token' };
-  assert.deepEqual(await checkTls('api.example.com', config), { status: 'tls_untrusted', expiry });
-  hostname = 'other.example.com';
-  assert.deepEqual(await checkTls('api.example.com', config), { status: 'scanner_error', expiry: null });
+  const checks = tlsChecks({ fetch: async () => { throw new Error('Unexpected browser launch'); } }, ['api.example.com']);
+  assert.deepEqual(await checks.check('api.example.com'), { status: 'no_public_address', expiry: null });
+  await checks.close();
 });

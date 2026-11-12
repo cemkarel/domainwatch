@@ -1,7 +1,8 @@
 import { day, decryptWebhook, dueThreshold } from './core.ts';
-import { checkDomain, checkTls, rdapBootstrap } from './checks.ts';
+import { checkDomain, rdapBootstrap } from './checks.ts';
 import { workspaceOwnerId, type Env } from './env.ts';
 import { sendSlack } from './network.ts';
+import { tlsChecks } from './tls.ts';
 
 interface Target {
   id: string;
@@ -27,7 +28,9 @@ const targetQuery = `
   FROM targets t LEFT JOIN notifications n USING(user_id)
 `;
 
-async function checkTarget(env: Env, target: Target, loadBootstrap = rdapBootstrap) {
+async function checkTarget(
+  env: Env, target: Target, checkTls: ReturnType<typeof tlsChecks>['check'], loadBootstrap = rdapBootstrap
+) {
   const now = Date.now();
   const lease = crypto.randomUUID();
   const claim = await env.DB.prepare('UPDATE targets SET next_check=?, lease=? WHERE id=? AND next_check<=?')
@@ -36,7 +39,7 @@ async function checkTarget(env: Env, target: Target, loadBootstrap = rdapBootstr
 
   const [domain, tls] = await Promise.all([
     loadBootstrap().then(bootstrap => checkDomain(target.domain, bootstrap)),
-    checkTls(target.hostname, env)
+    checkTls(target.hostname)
   ]);
   const checked = Date.now();
   const statements = [
@@ -73,7 +76,13 @@ async function checkTarget(env: Env, target: Target, loadBootstrap = rdapBootstr
 export async function checkNewTarget(env: Env, id: string) {
   const target = await env.DB.prepare(targetQuery + ' WHERE t.id=? AND t.user_id=?')
     .bind(id, workspaceOwnerId(env)).first<Target>();
-  return target ? checkTarget(env, target) : false;
+  if (!target) return false;
+  const tls = tlsChecks(env.TLS_BROWSER, [target.hostname]);
+  try {
+    return await checkTarget(env, target, tls.check);
+  } finally {
+    await tls.close();
+  }
 }
 
 async function checks(env: Env, now: number) {
@@ -82,8 +91,13 @@ async function checks(env: Env, now: number) {
   `).bind(workspaceOwnerId(env), now).all<Target>();
   let bootstrap: ReturnType<typeof rdapBootstrap> | undefined;
   const loadBootstrap = () => bootstrap ??= rdapBootstrap();
-  for (const target of results) {
-    await checkTarget(env, target, loadBootstrap);
+  const tls = tlsChecks(env.TLS_BROWSER, results.map(target => target.hostname));
+  try {
+    for (const target of results) {
+      await checkTarget(env, target, tls.check, loadBootstrap);
+    }
+  } finally {
+    await tls.close();
   }
 }
 

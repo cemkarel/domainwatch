@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { test } from 'node:test';
+import puppeteer, {
+  type Browser, type BrowserWorker, type HTTPRequest, type HTTPResponse, type WorkersLaunchOptions
+} from '@cloudflare/puppeteer';
 import worker from '../src/index.ts';
 import { day, encryptWebhook } from '../src/core.ts';
 import type { Env } from '../src/env.ts';
@@ -14,6 +17,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0001_init.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0002_shared_workspace.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0003_admin_auth.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0004_browser_tls.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -144,21 +148,55 @@ test('Adding a target saves its first RDAP and TLS results and queues alerts bef
   const f = fixture();
   t.after(() => f.sql.close());
   assert.equal((await f.login()).status, 200);
-  f.env.SCANNER_URL = 'https://scanner.example.com/check';
-  f.env.SCANNER_TOKEN = 'test-only';
+  f.env.TLS_BROWSER = { fetch } as Env['TLS_BROWSER'];
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
   const domainExpiry = new Date(Date.now() + 6 * day).toISOString();
-  const tlsExpiry = new Date(Date.now() + 3 * day).toISOString();
-  const fetchMock = t.mock.method(globalThis, 'fetch', async (url: string | URL, init: RequestInit) => {
+  const tlsExpiry = new Date(Math.floor((Date.now() + 3 * day) / 1000) * 1000).toISOString();
+  let onRequest: (request: HTTPRequest) => Promise<void>;
+  let onResponse: (response: HTTPResponse) => void;
+  const close = t.mock.fn(async () => {});
+  const page = {
+    setJavaScriptEnabled: async (enabled: boolean) => assert.equal(enabled, false),
+    setRequestInterception: async (enabled: boolean) => assert.equal(enabled, true),
+    on(event: string, listener: typeof onRequest | typeof onResponse) {
+      if (event === 'request') onRequest = listener as typeof onRequest;
+      else if (event === 'response') onResponse = listener as typeof onResponse;
+    },
+    async goto(url: string) {
+      assert.equal(url, 'https://api.example.com/');
+      const request = {
+        url: () => url,
+        isNavigationRequest: () => true,
+        continue: t.mock.fn(async ({ method }: { method: string }) => assert.equal(method, 'HEAD'))
+      };
+      await onRequest(request as unknown as HTTPRequest);
+      assert.equal(request.continue.mock.callCount(), 1);
+      const abort = t.mock.fn(async () => {});
+      await onRequest({ url: () => 'https://other.example.com/', isNavigationRequest: () => true, abort } as unknown as HTTPRequest);
+      assert.equal(abort.mock.callCount(), 1);
+      onResponse({
+        url: () => url, request: () => request, remoteAddress: () => ({ ip: '8.8.8.8' }),
+        securityDetails: () => ({ validTo: () => Date.parse(tlsExpiry) / 1000 })
+      } as unknown as HTTPResponse);
+    },
+    close: async () => {}
+  };
+  const launch = t.mock.method(puppeteer, 'launch', async (binding: BrowserWorker, options?: WorkersLaunchOptions) => {
+    assert.equal(binding, f.env.TLS_BROWSER);
+    assert.deepEqual(options?.guardrails?.allowedDomains, ['api.example.com']);
+    return { newPage: async () => page, close } as unknown as Browser;
+  });
+  const fetchMock = t.mock.method(globalThis, 'fetch', async (url: string | URL) => {
     if (url === 'https://data.iana.org/rdap/dns.json') {
       return Response.json({ services: [[['com'], ['https://rdap.example.com/']]] });
     }
     if (String(url) === 'https://rdap.example.com/domain/example.com') {
       return Response.json({ objectClassName: 'domain', events: [{ eventAction: 'expiration', eventDate: domainExpiry }] });
     }
-    if (String(url) === f.env.SCANNER_URL) {
-      assert.equal(init.body, JSON.stringify({ hostname: 'api.example.com' }));
-      return Response.json({ hostname: 'api.example.com', status: 'ok', expiry: tlsExpiry });
+    if (url instanceof URL && url.hostname === 'cloudflare-dns.com') {
+      assert.equal(url.searchParams.get('name'), 'api.example.com');
+      const Answer = url.searchParams.get('type') === 'A' ? [{ type: 1, data: '8.8.8.8' }] : [];
+      return Response.json({ Status: 0, Answer });
     }
     throw new Error('Unexpected URL ' + url);
   });
@@ -177,7 +215,9 @@ test('Adding a target saves its first RDAP and TLS results and queues alerts bef
   const alerts = f.sql.prepare('SELECT kind FROM alerts WHERE target_id=? ORDER BY kind').all(id);
   assert.deepEqual(alerts.map(alert => alert.kind), ['domain', 'tls']);
   assert.equal((await f.request('/targets', 'POST', { hostname: 'api.example.com' })).status, 409);
-  assert.equal(fetchMock.mock.callCount(), 3);
+  assert.equal(fetchMock.mock.callCount(), 4);
+  assert.equal(launch.mock.callCount(), 1);
+  assert.equal(close.mock.callCount(), 1);
 });
 
 test('A configured workspace owner reuses legacy targets and encrypted Slack settings', async t => {
@@ -203,7 +243,11 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   t.after(() => f.sql.close());
   assert.equal((await f.login()).status, 200);
   f.seedLegacyTarget();
-  f.sql.prepare("INSERT INTO targets (id,user_id,hostname,domain) VALUES ('pending-id','shared','api.example.com','example.com')").run();
+  f.sql.prepare(`
+    INSERT INTO targets (id,user_id,hostname,domain,tls_status,next_check)
+    VALUES ('pending-id','shared','api.example.com','example.com','scanner_unconfigured',?)
+  `).run(Date.now() + day);
+  f.sql.exec(readFileSync(new URL('../migrations/0004_browser_tls.sql', import.meta.url), 'utf8'));
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
   const expiry = new Date(Date.now() + 6 * day).toISOString();
   let slackRequests = 0;

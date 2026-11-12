@@ -11,11 +11,10 @@
     "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
     "types": "wrangler types --env-interface WorkerBindings",
     "typecheck": "npm run types && tsc --noEmit",
-    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts",
-    "scanner": "node scanner/server.mjs",
-    "poc:tls": "wrangler dev --config poc/wrangler.jsonc --port 8788"
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.ts"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "^2.0.0",
     "hono": "^4.11.0",
     "ipaddr.js": "^2.2.0",
     "react": "^19.2.0",
