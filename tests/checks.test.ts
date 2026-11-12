@@ -18,8 +18,9 @@ test('RDAP distinguishes unsupported TLDs from bootstrap failures and tries a re
 });
 
 test('TLS checks reject a host with non-public DNS answers before launching a browser', async t => {
-  t.mock.method(globalThis, 'fetch', async (url: URL) => {
+  t.mock.method(globalThis, 'fetch', async (url: URL, init: RequestInit) => {
     assert.equal(url.hostname, 'cloudflare-dns.com');
+    assert.equal(init.redirect, 'manual');
     assert.equal(url.searchParams.get('name'), 'api.example.com');
     const ipv4 = url.searchParams.get('type') === 'A';
     return Response.json({ Status: 0, Answer: [{ type: ipv4 ? 1 : 28, data: ipv4 ? '8.8.8.8' : '::1' }] });

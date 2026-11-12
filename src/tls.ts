@@ -12,7 +12,7 @@ async function resolveAddresses(hostname: string, type: 'A' | 'AAAA') {
   const url = new URL('https://cloudflare-dns.com/dns-query');
   url.search = new URLSearchParams({ name: hostname, type }).toString();
   const response = await fetch(url, {
-    headers: { Accept: 'application/dns-json' }, redirect: 'error', signal: AbortSignal.timeout(4000)
+    headers: { Accept: 'application/dns-json' }, redirect: 'manual', signal: AbortSignal.timeout(4000)
   });
   if (!response.ok) {
     await response.body?.cancel();
@@ -100,7 +100,8 @@ export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[
           await page.close().catch(() => {});
         }
       } catch (error) {
-        console.warn({ event: 'tls_browser_failure', hostname, error: String(error).replace(/(?:https?|wss?):\/\/\S+/g, '[url]') });
+        const detail = String(error).replace(/(?:https?|wss?):\/\/\S+/g, '[url]').slice(0, 240);
+        console.warn({ event: 'tls_browser_failure', hostname, error: detail });
         return { status: 'scanner_error', expiry: null };
       }
     },
