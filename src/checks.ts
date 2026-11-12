@@ -9,7 +9,8 @@ export interface Check {
 const fallback = new Map([
   ['com', 'https://rdap.verisign.com/com/v1/'],
   ['net', 'https://rdap.verisign.com/net/v1/'],
-  ['org', 'https://rdap.publicinterestregistry.org/rdap/']
+  ['org', 'https://rdap.publicinterestregistry.org/rdap/'],
+  ['io', 'https://rdap.identitydigital.services/rdap/']
 ]);
 
 export async function rdapBootstrap(): Promise<Map<string, string[]> | null> {

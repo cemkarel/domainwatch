@@ -34,6 +34,19 @@ test('TRABİS WHOIS reads a suspended registration and rejects a wrong or invali
     { status: 'whois_error', expiry: null });
 });
 
+test('The .io registry fallback reads the domain expiry when IANA has no entry', async t => {
+  const fetch = t.mock.method(globalThis, 'fetch', async (url: URL) => {
+    assert.equal(url.href, 'https://rdap.identitydigital.services/rdap/domain/anbean.io');
+    return Response.json({ objectClassName: 'domain', events: [
+      { eventAction: 'registration', eventDate: '2026-03-21T09:04:51.32Z' },
+      { eventAction: 'expiration', eventDate: '2036-03-21T09:04:51.32Z' }
+    ] });
+  });
+  assert.deepEqual(await checkDomain('anbean.io', async () => new Map()),
+    { status: 'ok', expiry: '2036-03-21T09:04:51.320Z' });
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
 test('TLS checks reject a host with non-public DNS answers before launching a browser', async t => {
   t.mock.method(globalThis, 'fetch', async (url: URL, init: RequestInit) => {
     assert.equal(url.hostname, 'cloudflare-dns.com');
