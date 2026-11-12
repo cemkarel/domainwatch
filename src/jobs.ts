@@ -48,7 +48,7 @@ async function checkTarget(
     .bind(now + 10 * 60_000, lease, target.id, now).run();
   if (!claim.meta.changes) return false;
 
-  const domainCheck = settleWithin<Check>(loadBootstrap().then(bootstrap => checkDomain(target.domain, bootstrap)),
+  const domainCheck = settleWithin<Check>(checkDomain(target.domain, loadBootstrap),
     20_000, { status: 'rdap_error', expiry: null }).then(async result => {
     await env.DB.prepare('UPDATE targets SET domain_status=?, domain_expiry=? WHERE id=? AND lease=?')
       .bind(result.status, result.expiry, target.id, lease).run();
@@ -142,8 +142,10 @@ async function deliveries(env: Env, now: number) {
       try {
         const url = await decryptWebhook(current.encrypted_url, env.WEBHOOK_KEY, alert.user_id);
         const kind = alert.kind === 'tls' ? 'TLS certificate' : 'Domain registration';
+        const expires = alert.kind === 'domain' && alert.hostname.endsWith('.tr')
+          ? `expires on ${alert.expiry.slice(0, 10)}` : `expires at ${alert.expiry}`;
         delivery = await sendSlack(url,
-          `DomainWatch · ${kind} for ${alert.hostname} expires at ${alert.expiry} (${alert.threshold}-day alert).`);
+          `DomainWatch · ${kind} for ${alert.hostname} ${expires} (${alert.threshold}-day alert).`);
       } catch {
         delivery = { ok: false, retry: false, result: 'webhook_decryption_error' };
       }

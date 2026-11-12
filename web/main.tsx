@@ -174,6 +174,10 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     dateStyle: 'medium', timeStyle: 'short'
   }), [copy.locale]);
   const formatDate = (value: string | number) => dateFormat.format(new Date(value));
+  const domainDateFormat = useMemo(() => new Intl.DateTimeFormat(copy.locale, {
+    dateStyle: 'medium', timeZone: 'UTC'
+  }), [copy.locale]);
+  const formatDomainDate = (value: string) => domainDateFormat.format(new Date(value));
   const [targets, setTargets] = useState<Target[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [settings, setSettings] = useState<Settings>();
@@ -284,7 +288,8 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
             <thead><tr><th>{copy.address}</th><th>{copy.domainExpiry}</th><th>{copy.tlsExpiry}</th><th>{copy.lastCheck}</th><th>{copy.actions}</th></tr></thead>
             <tbody>{targets.map(target => <tr key={target.id}>
               <td><strong>{target.hostname}</strong>{target.hostname !== target.domain && <div className="muted">{target.domain}</div>}</td>
-              <td>{expiryView(target.domain_status, target.domain_expiry, copy, formatDate)}</td>
+              <td>{expiryView(target.domain_status, target.domain_expiry, copy,
+                target.domain.endsWith('.tr') ? formatDomainDate : formatDate)}</td>
               <td>{expiryView(target.tls_status, target.tls_expiry, copy, formatDate)}</td>
               <td className="muted">{target.checked_at ? formatDate(target.checked_at) : copy.statuses.pending}</td>
               <td><button className="quiet" disabled={busy} aria-label={copy.removeLabel(target.hostname)}

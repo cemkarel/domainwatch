@@ -3,21 +3,35 @@ import { X509Certificate } from 'node:crypto';
 import { test } from 'node:test';
 import { rootCertificates } from 'node:tls';
 import puppeteer, { type Browser } from '@cloudflare/puppeteer';
-import { checkDomain } from '../src/checks.ts';
+import { checkDomain, parseTrabisWhois } from '../src/checks.ts';
 import { tlsChecks } from '../src/tls.ts';
 
 test('RDAP distinguishes unsupported TLDs from bootstrap failures and tries a registry fallback', async t => {
-  assert.deepEqual(await checkDomain('example.constructor', new Map()), { status: 'unsupported', expiry: null });
-  assert.deepEqual(await checkDomain('example.constructor', null), { status: 'bootstrap_unavailable', expiry: null });
+  assert.deepEqual(await checkDomain('example.constructor', async () => new Map()), { status: 'unsupported', expiry: null });
+  assert.deepEqual(await checkDomain('example.constructor', async () => null), { status: 'bootstrap_unavailable', expiry: null });
   const called: string[] = [];
   t.mock.method(globalThis, 'fetch', async (url: URL) => {
     called.push(url.href);
     if (called.length === 1) return new Response(null, { status: 503 });
     return Response.json({ objectClassName: 'domain', events: [] });
   });
-  assert.deepEqual(await checkDomain('example.com', new Map([['com', ['https://rdap.example.com/']]])),
+  assert.deepEqual(await checkDomain('example.com', async () => new Map([['com', ['https://rdap.example.com/']]])),
     { status: 'no_expiration', expiry: null });
   assert.deepEqual(called, ['https://rdap.example.com/domain/example.com', 'https://rdap.verisign.com/com/v1/domain/example.com']);
+});
+
+test('TRABİS WHOIS reads a suspended registration and rejects a wrong or invalid record', () => {
+  const record = '** Domain Name: unitedracing.tr\r\nDomain Status: Suspended\r\nExpires on..............: 2026-Nov-10.\r\n';
+  assert.deepEqual(parseTrabisWhois('unitedracing.tr', record), { status: 'ok', expiry: '2026-11-10T00:00:00.000Z' });
+  assert.deepEqual(parseTrabisWhois('example.com.tr', record.replace('unitedracing.tr', 'example.com.tr')),
+    { status: 'ok', expiry: '2026-11-10T00:00:00.000Z' });
+  assert.deepEqual(parseTrabisWhois('unitedracing.tr', 'No match found for unitedracing.tr\r\n'),
+    { status: 'not_found', expiry: null });
+  assert.deepEqual(parseTrabisWhois('unitedracing.tr', '** Domain Name: unitedracing.tr\n'),
+    { status: 'no_expiration', expiry: null });
+  assert.deepEqual(parseTrabisWhois('other.tr', record), { status: 'whois_error', expiry: null });
+  assert.deepEqual(parseTrabisWhois('unitedracing.tr', record.replace('Nov-10', 'Feb-30')),
+    { status: 'whois_error', expiry: null });
 });
 
 test('TLS checks reject a host with non-public DNS answers before launching a browser', async t => {

@@ -1,15 +1,14 @@
 import { webhookUrl } from './core.ts';
 
-export async function boundedJson(response: Response, limit: number): Promise<unknown> {
-  if (!response.body) throw new Error('Empty body');
-  const reader = response.body.getReader();
+export async function boundedText(stream: ReadableStream<Uint8Array>, limit: number): Promise<string> {
+  const reader = stream.getReader();
   const decoder = new TextDecoder();
   let size = 0;
   let body = '';
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) return JSON.parse(body + decoder.decode());
+      if (done) return body + decoder.decode();
       size += value.byteLength;
       if (size > limit) throw new Error('Response too large');
       body += decoder.decode(value, { stream: true });
@@ -17,6 +16,11 @@ export async function boundedJson(response: Response, limit: number): Promise<un
   } finally {
     await reader.cancel().catch(() => {});
   }
+}
+
+export async function boundedJson(response: Response, limit: number): Promise<unknown> {
+  if (!response.body) throw new Error('Empty body');
+  return JSON.parse(await boundedText(response.body, limit));
 }
 
 export async function sendSlack(value: string, text: string) {

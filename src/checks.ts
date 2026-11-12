@@ -1,4 +1,5 @@
-import { boundedJson } from './network.ts';
+import { normalizeHost } from './core.ts';
+import { boundedJson, boundedText } from './network.ts';
 
 export interface Check {
   status: string;
@@ -47,8 +48,60 @@ export function expiryDate(value: unknown) {
   return Number.isFinite(date) ? new Date(date).toISOString() : null;
 }
 
-export async function checkDomain(domain: string, bootstrap: Map<string, string[]> | null): Promise<Check> {
+const whoisError: Check = { status: 'whois_error', expiry: null };
+const months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+export function parseTrabisWhois(domain: string, body: string): Check {
+  const name = /^\*\* Domain Name:[ \t]*([^\s]+)[ \t]*$/im.exec(body)?.[1]?.toLowerCase();
+  if (name !== domain) {
+    const missing = /^No match found for[ \t]+([^\s]+)[ \t]*$/im.exec(body)?.[1]?.toLowerCase();
+    return !name && missing === domain ? { status: 'not_found', expiry: null } : whoisError;
+  }
+
+  const value = /^Expires on\.*:([^\r\n]*)/im.exec(body)?.[1]?.trim();
+  if (!value || value === '-') return { status: 'no_expiration', expiry: null };
+  const date = /^(\d{4})-([a-z]{3})-(\d{1,2})\.?$/i.exec(value);
+  if (!date) return whoisError;
+  const month = months.indexOf(date[2].toLowerCase()) + 1;
+  const day = `${date[1]}-${String(month).padStart(2, '0')}-${date[3].padStart(2, '0')}`;
+  const expiry = month ? expiryDate(day) : null;
+  return expiry?.startsWith(day) ? { status: 'ok', expiry } : whoisError;
+}
+
+async function checkTrabis(domain: string): Promise<Check> {
+  if (normalizeHost(domain)?.domain !== domain) return whoisError;
+  let socket: Socket | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const { connect } = await import('cloudflare:sockets');
+    const connection = socket = connect({ hostname: 'whois.trabis.gov.tr', port: 43 });
+    void connection.closed.catch(() => {});
+
+    const query = async () => {
+      await connection.opened;
+      const writer = connection.writable.getWriter();
+      try {
+        await writer.write(new TextEncoder().encode(domain + '\r\n'));
+      } finally {
+        writer.releaseLock();
+      }
+      return parseTrabisWhois(domain, await boundedText(connection.readable, 16_384));
+    };
+    return await Promise.race([query(), new Promise<Check>(resolve => {
+      timer = setTimeout(() => resolve(whoisError), 7000);
+    })]);
+  } catch {
+    return whoisError;
+  } finally {
+    clearTimeout(timer);
+    await socket?.close().catch(() => {});
+  }
+}
+
+export async function checkDomain(domain: string, loadBootstrap = rdapBootstrap): Promise<Check> {
   const tld = domain.split('.').at(-1)!;
+  if (tld === 'tr') return checkTrabis(domain);
+  const bootstrap = await loadBootstrap();
   const registry = fallback.get(tld);
   const bases = [...(bootstrap?.get(tld) ?? [])];
   if (registry) bases.push(registry);

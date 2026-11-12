@@ -57,6 +57,8 @@ Deploy komutu, build'in çalıştığı hesapta `domainwatch` adlı D1 veritaban
 
 İlk girişten önce **Settings → Variables and Secrets** bölümüne `ADMIN_PASSWORD` adında bir Worker secret ekleyin ve `admin` kullanıcısıyla giriş yapın. İlk başarılı girişte parolanın tuzlanmış özeti D1'e kaydedilir. Bundan sonra `ADMIN_PASSWORD` kaldırılabilir. **Ayarlar → Parolayı değiştir** bölümünde mevcut parolanızı girerek yeni parola belirleyebilirsiniz. Değişiklik tüm oturumları kapatır. [Cloudflare Workers secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 
+Başka bir Cloudflare hesabına dağıtırken `ADMIN_PASSWORD` değerini yeni Worker'ın **Production** çalışma zamanı ayarlarına 12–128 karakterlik bir secret olarak ekleyip **Deploy** seçeneğiyle etkinleştirin. D1'de daha önce bir admin parolası oluşturulduysa girişte o parola kullanılır. `APP_ORIGIN` tanımlıysa paneli açtığınız yeni HTTPS adresiyle birebir eşleşmelidir. Cloudflare Builds deploy komutunu `npm run deploy:cloudflare` olarak ayarlayın ve dağıtım kaydında D1 migrasyonlarının tamamlandığını kontrol edin.
+
 Gerekirse **Settings → Variables and Secrets** bölümünde şu değerleri girin.
 
 - Eski bir hesabın listesini, bildirim geçmişini ve Slack ayarlarını ortak çalışma alanı olarak kullanmak için `WORKSPACE_OWNER_ID` değerine D1'deki `users.id` değerini girin. Şifreli Slack ayarları için önceki `WEBHOOK_KEY` değerini kullanın. Bu değişken boşken panel ve Cron yeni ortak çalışma alanını kullanır.
@@ -69,6 +71,7 @@ TLS kontrolü dağıtımda otomatik bağlanır. Önceki kurulumdan kalan `SCANNE
 ## Kontrol ve bildirim davranışı
 
 - RDAP için Public Suffix List ile kayıt edilebilir alan adı bulunur. IANA'nın bootstrap listesi, TLD'nin HTTPS RDAP adreslerini belirler. İlk adres başarısızsa sıradaki denenir. `.com`, `.net` ve `.org` için kayıt operatörü adresleri ek fallback olarak tanımlıdır. RDAP desteği, kayıt bulunamaması, tarihin paylaşılmaması ve bağlantı hatası ayrı durumlar olarak görünür. [IANA RDAP bootstrap](https://data.iana.org/rdap/dns.json)
+- `.tr` alan adlarının kayıt bitiş tarihi, TRABİS WHOIS sunucusundan doğrudan sorgulanır. Sicil yalnızca gün bilgisi verdiği için panelde saat gösterilmez. Daha önce bitiş tarihi alınamayan `.tr` adresleri dağıtım sonrası yeniden kontrol sırasına alınır. [TRABİS WHOIS](https://www.trabis.gov.tr/whois)
 - Yeni adres eklenince ilk RDAP ve TLS kontrolleri arka planda başlar. Alan adı bitişi hazır olduğunda listede görünür. TLS kontrolü 22 saniye içinde tamamlanamazsa zaman aşımı durumu gösterilir. İlk kontrol yarıda kesilirse adres Cron tarafından tekrar alınır.
 - Her tamamlanan kontrolden 24 saat sonra adres yeniden kontrol için uygun hale gelir. Cron beş dakikada bir, aktif çalışma alanında süresi gelen en fazla iki adresi ve dört bildirimi işler. MVP sınırı çalışma alanı başına 25 ve veritabanında toplam 400 adrestir. Trafik ve Cron CPU kullanımı gerçek dağıtımda gözlemlenmelidir. [Workers limitleri](https://developers.cloudflare.com/workers/platform/limits/) · [D1 fiyatlandırması](https://developers.cloudflare.com/d1/platform/pricing/)
 - 30/14/7/3/1 günlük pencerelerden en yakın seçili eşiğe bildirim yazılır. Örneğin ilk kontrolde 5 gün kaldıysa 7 günlük bildirim hazırlanır. D1'de adres, tarih türü, bitiş tarihi ve eşik kombinasyonu tekrar planlamayı önler.
