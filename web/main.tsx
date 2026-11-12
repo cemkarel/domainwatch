@@ -183,9 +183,14 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const [settings, setSettings] = useState<Settings>();
   const [page, setPage] = useState<'targets' | 'settings' | 'alerts'>('targets');
   const [host, setHost] = useState('');
+  const [search, setSearch] = useState('');
   const [url, setUrl] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice>();
+  const query = search.trim().toLowerCase();
+  const visibleTargets = query ? targets.filter(target =>
+    target.hostname.toLowerCase().includes(query) || target.domain.toLowerCase().includes(query)) : targets;
+
   function showError(error: unknown) {
     const code = errorCode(error);
     if (code === 'unauthenticated') onSignOut();
@@ -283,10 +288,13 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
           </label>
           <button className="button" disabled={busy}>{copy.add}</button>
         </form>
-        <section className="panel mt-5 overflow-x-auto" aria-label={copy.trackedAddresses}>
-          {targets.length ? <table>
+        <label className="mt-5 block max-w-sm">{copy.searchTargets}
+          <input type="search" value={search} onChange={event => setSearch(event.target.value)} spellCheck={false} />
+        </label>
+        <section className="panel mt-3 overflow-x-auto" aria-label={copy.trackedAddresses}>
+          {visibleTargets.length ? <table>
             <thead><tr><th>{copy.address}</th><th>{copy.domainExpiry}</th><th>{copy.tlsExpiry}</th><th>{copy.lastCheck}</th><th>{copy.actions}</th></tr></thead>
-            <tbody>{targets.map(target => <tr key={target.id}>
+            <tbody>{visibleTargets.map(target => <tr key={target.id}>
               <td><strong>{target.hostname}</strong>{target.hostname !== target.domain && <div className="muted">{target.domain}</div>}</td>
               <td>{expiryView(target.domain_status, target.domain_expiry, copy,
                 target.domain.endsWith('.tr') ? formatDomainDate : formatDate)}</td>
@@ -297,7 +305,7 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
                   await api('/targets/' + target.id, 'DELETE'); await loadTargets();
                 }); }}>{copy.remove}</button></td>
             </tr>)}</tbody>
-          </table> : <p className="muted p-8">{copy.emptyTargets}</p>}
+          </table> : <p className="muted p-8" role="status">{targets.length ? copy.noMatchingTargets : copy.emptyTargets}</p>}
         </section>
       </>}
       {page === 'settings' && <>
