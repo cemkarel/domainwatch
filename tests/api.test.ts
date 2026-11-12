@@ -21,6 +21,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0005_retry_unreachable_tls.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0006_webhook_key_deploy_lock.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0007_retry_tls_certificate_checks.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0008_retry_tls_dns_status.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -267,9 +268,9 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   f.seedLegacyTarget();
   f.sql.prepare(`
     INSERT INTO targets (id,user_id,hostname,domain,tls_status,next_check)
-    VALUES ('pending-id','shared','api.example.com','example.com','tls_unreachable',?)
+    VALUES ('pending-id','shared','api.example.com','example.com','no_public_address',?)
   `).run(Date.now() + day);
-  f.sql.exec(readFileSync(new URL('../migrations/0007_retry_tls_certificate_checks.sql', import.meta.url), 'utf8'));
+  f.sql.exec(readFileSync(new URL('../migrations/0008_retry_tls_dns_status.sql', import.meta.url), 'utf8'));
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
   const expiry = new Date(Date.now() + 6 * day).toISOString();
   let slackRequests = 0;

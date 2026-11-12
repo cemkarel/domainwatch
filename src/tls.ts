@@ -10,6 +10,12 @@ function isPublicAddress(address: string) {
   return ipaddr.isValid(address) && ipaddr.process(address).range() === 'unicast';
 }
 
+function matchesCertificateName(hostname: string, name: string) {
+  const san = name.toLowerCase();
+  const dot = hostname.indexOf('.');
+  return san === hostname || (dot !== -1 && san === '*.' + hostname.slice(dot + 1));
+}
+
 async function resolveAddresses(hostname: string, type: 'A' | 'AAAA') {
   const url = new URL('https://cloudflare-dns.com/dns-query');
   url.search = new URLSearchParams({ name: hostname, type }).toString();
@@ -31,7 +37,7 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
   let method: 'HEAD' | 'GET' = 'GET';
   let expiry: string | null = null;
   let receivedResponse = false;
-  let nonPublicPeer = false;
+  let peerNeedsProof = false;
   await page.setJavaScriptEnabled(false);
   await page.setCacheEnabled(false);
   await page.setRequestInterception(true);
@@ -47,14 +53,20 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
   let untrusted = false;
   try {
     await cdp.send('Network.enable');
-    const readExpiry = (response: { url: string; remoteIPAddress?: string; securityDetails?: { validTo: number } }) => {
+    const readExpiry = (response: {
+      url: string;
+      remoteIPAddress?: string;
+      securityDetails?: { validTo: number; sanList?: string[] };
+    }) => {
       if (response.url !== url) return;
-      if (response.remoteIPAddress && !isPublicAddress(response.remoteIPAddress)) {
-        nonPublicPeer = true;
-        return;
-      }
       receivedResponse = true;
-      const validTo = response.securityDetails?.validTo;
+      const details = response.securityDetails;
+      // The DevTools peer can be a browser proxy. Require hostname evidence for that response.
+      if (response.remoteIPAddress && !isPublicAddress(response.remoteIPAddress)) {
+        peerNeedsProof = true;
+        if (!details?.sanList?.some(name => matchesCertificateName(hostname, name))) return;
+      }
+      const validTo = details?.validTo;
       if (validTo !== undefined && Number.isFinite(validTo)) expiry = new Date(validTo * 1000).toISOString();
     };
     cdp.on('Network.responseReceived', event => readExpiry(event.response));
@@ -81,17 +93,17 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
       error = await navigate('GET');
       if (!expiry) error = await navigate('HEAD');
     }
-    if (nonPublicPeer) return { status: 'no_public_address', expiry: null };
     if (!expiry) {
       try {
         const { tableNames: [leaf] } = await cdp.send('Network.getCertificate', { origin: 'https://' + hostname });
         if (leaf) {
           const certificate = new X509Certificate(Buffer.from(leaf, 'base64'));
           const validTo = Date.parse(certificate.validTo);
-          if (Number.isFinite(validTo)) {
+          const matchesHost = Boolean(certificate.checkHost(hostname));
+          if (Number.isFinite(validTo) && (!peerNeedsProof || matchesHost)) {
             expiry = new Date(validTo).toISOString();
             const now = Date.now();
-            untrusted ||= validTo <= now || Date.parse(certificate.validFrom) > now || !certificate.checkHost(hostname);
+            untrusted ||= validTo <= now || Date.parse(certificate.validFrom) > now || !matchesHost;
           }
         }
       } catch {
@@ -101,7 +113,8 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
     if (expiry || untrusted) return { status: untrusted ? 'tls_untrusted' : 'ok', expiry };
 
     const status = receivedResponse ? 'tls_certificate_unavailable' : 'tls_unreachable';
-    console.warn({ event: 'tls_navigation_failed', hostname, status, error: error ?? 'missing_certificate_details' });
+    console.warn({ event: 'tls_navigation_failed', hostname, status,
+      error: peerNeedsProof ? 'browser_peer_without_matching_certificate' : error ?? 'missing_certificate_details' });
     return { status, expiry: null };
   } finally {
     if (untrusted) await cdp.send('Security.setIgnoreCertificateErrors', { ignore: false }).catch(() => {});
@@ -131,6 +144,7 @@ export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[
         const [ipv4, ipv6] = await Promise.all([resolveAddresses(hostname, 'A'), resolveAddresses(hostname, 'AAAA')]);
         const addresses = [...ipv4, ...ipv6];
         if (!addresses.length || !addresses.every(isPublicAddress)) {
+          console.warn({ event: 'tls_dns_rejected', hostname, reason: addresses.length ? 'non_public_dns_answer' : 'no_address_records' });
           return { status: 'no_public_address', expiry: null };
         }
 

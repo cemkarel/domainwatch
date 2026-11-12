@@ -37,7 +37,12 @@ test('TLS checks can read the leaf certificate when the HTTP event omits its exp
   const certificate = new X509Certificate(rootCertificates[0]);
   const origin = 'https://api.example.com';
   let recovered = true;
-  let onResponse: (event: { response: { url: string; remoteIPAddress: string } }) => void;
+  let peer = '8.8.8.8';
+  let sanList: string[] | undefined;
+  const browserExpiry = Date.parse('2030-02-01T00:00:00Z') / 1000;
+  let onResponse: (event: { response: {
+    url: string; remoteIPAddress: string; securityDetails?: { validTo: number; sanList: string[] };
+  } }) => void;
   const page = {
     setJavaScriptEnabled: async () => {},
     setCacheEnabled: async () => {},
@@ -58,7 +63,8 @@ test('TLS checks can read the leaf certificate when the HTTP event omits its exp
       };
     },
     async goto(url: string) {
-      onResponse({ response: { url, remoteIPAddress: '8.8.8.8' } });
+      onResponse({ response: { url, remoteIPAddress: peer,
+        securityDetails: sanList && { validTo: browserExpiry, sanList } } });
     },
     close: async () => {}
   };
@@ -73,6 +79,13 @@ test('TLS checks can read the leaf certificate when the HTTP event omits its exp
     });
     recovered = false;
     assert.deepEqual(await checks.check('api.example.com'), { status: 'tls_certificate_unavailable', expiry: null });
+
+    peer = '127.0.0.1';
+    recovered = true;
+    sanList = ['other.example.com'];
+    assert.deepEqual(await checks.check('api.example.com'), { status: 'tls_certificate_unavailable', expiry: null });
+    sanList = ['*.example.com'];
+    assert.deepEqual(await checks.check('api.example.com'), { status: 'ok', expiry: '2030-02-01T00:00:00.000Z' });
   } finally {
     await checks.close();
   }
