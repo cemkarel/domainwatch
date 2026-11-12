@@ -1,6 +1,6 @@
 import { day, decryptWebhook, dueThreshold } from './core.ts';
 import { checkDomain, checkTls, rdapBootstrap } from './checks.ts';
-import type { Env } from './env.ts';
+import { workspaceOwnerId, type Env } from './env.ts';
 import { sendSlack } from './network.ts';
 
 interface Target {
@@ -27,8 +27,8 @@ async function checks(env: Env, now: number) {
   const { results } = await env.DB.prepare(`
     SELECT t.id, t.user_id, t.hostname, t.domain, n.enabled, n.thresholds, n.version
     FROM targets t LEFT JOIN notifications n USING(user_id)
-    WHERE t.next_check <= ? ORDER BY t.next_check, t.id LIMIT 2
-  `).bind(now).all<Target>();
+    WHERE t.user_id=? AND t.next_check<=? ORDER BY t.next_check, t.id LIMIT 2
+  `).bind(workspaceOwnerId(env), now).all<Target>();
   if (!results.length) return;
   const bootstrap = await rdapBootstrap();
   for (const target of results) {
@@ -75,8 +75,8 @@ async function deliveries(env: Env, now: number) {
   const { results } = await env.DB.prepare(`
     SELECT a.id, a.kind, a.expiry, a.threshold, a.attempts, t.hostname, t.user_id
     FROM alerts a JOIN targets t ON t.id=a.target_id
-    WHERE a.state='pending' AND a.next_attempt<=? ORDER BY a.next_attempt LIMIT 4
-  `).bind(now).all<Alert>();
+    WHERE t.user_id=? AND a.state='pending' AND a.next_attempt<=? ORDER BY a.next_attempt LIMIT 4
+  `).bind(workspaceOwnerId(env), now).all<Alert>();
   for (const alert of results) {
     const claim = crypto.randomUUID();
     const result = await env.DB.prepare(`
@@ -114,9 +114,5 @@ async function deliveries(env: Env, now: number) {
 export async function scheduled(env: Env) {
   const now = Date.now();
   const results = await Promise.allSettled([checks(env, now), deliveries(env, now)]);
-  if (new Date(now).getUTCMinutes() === 0) {
-    await env.DB.prepare('DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM sessions WHERE expires<? LIMIT 100)')
-      .bind(now).run();
-  }
   if (results.some(result => result.status === 'rejected')) throw new Error('Scheduled job failed');
 }

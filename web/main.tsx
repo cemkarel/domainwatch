@@ -25,6 +25,7 @@ const errors: Record<string, string> = {
   invalid_hostname: 'example.com biçiminde bir alan adı veya alt alan adı girin.',
   duplicate_hostname: 'Bu adres zaten listenizde.', target_limit: 'Takip sınırına ulaşıldı.',
   invalid_webhook: 'Geçerli bir Slack Incoming Webhook adresi girin.',
+  invalid_origin: 'Bu adresten değişiklik yapılamıyor.',
   webhook_required: 'Önce webhook adresini kaydedin.',
   invalid_settings: 'En az bir bildirim eşiği seçin.',
   settings_changed: 'Ayarlar başka bir oturumda değişti. Sayfayı yenileyin.',
@@ -36,7 +37,7 @@ const formatDate = (value: string | number) => new Intl.DateTimeFormat('tr-TR', 
 }).format(new Date(value));
 
 class ApiError extends Error {
-  constructor(public status: number, public code: string) { super(code); }
+  constructor(public code: string) { super(code); }
 }
 
 async function api<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
@@ -46,7 +47,7 @@ async function api<T>(path: string, method = 'GET', data?: unknown): Promise<T> 
   });
   if (!response.ok) {
     const result = await response.json() as { error: string };
-    throw new ApiError(response.status, result.error);
+    throw new ApiError(result.error);
   }
   return await response.json() as T;
 }
@@ -65,8 +66,6 @@ function expiryView(status: string, expiry: string | null) {
 }
 
 function App() {
-  const [user, setUser] = useState<string | null>();
-  const [initialError, setInitialError] = useState(false);
   const [targets, setTargets] = useState<Target[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [settings, setSettings] = useState<Settings>();
@@ -77,10 +76,6 @@ function App() {
   const [notice, setNotice] = useState<{ message: string; error?: boolean }>();
 
   function showError(error: unknown) {
-    if (error instanceof ApiError && error.status === 401) {
-      setUser(null);
-      return;
-    }
     const code = error instanceof ApiError ? error.code : '';
     setNotice({ error: true, message: errors[code] ??
       (code.startsWith('slack_') ? 'Slack teslimi başarısız (' + code + ').' : 'İşlem başarısız. Tekrar deneyin.') });
@@ -91,19 +86,11 @@ function App() {
   const loadSettings = async () => setSettings(await api<Settings>('/settings/slack'));
 
   useEffect(() => {
-    api<{ login: string }>('/me').then(result => setUser(result.login)).catch(error => {
-      if (error instanceof ApiError && error.status === 401) setUser(null);
-      else setInitialError(true);
-    });
-  }, []);
-
-  useEffect(() => {
-    if (!user) return;
     const load = page === 'targets' ? loadTargets : page === 'settings' ? loadSettings : loadAlerts;
     void load().catch(showError);
     const interval = page === 'settings' ? undefined : setInterval(() => void load().catch(showError), 30_000);
     return () => clearInterval(interval);
-  }, [user, page]);
+  }, [page]);
 
   async function run(action: () => Promise<void>) {
     if (busy) return;
@@ -133,27 +120,9 @@ function App() {
     });
   }
 
-  if (!user) return <main className="login">
-    <section className="panel p-8 sm:p-12">
-      <Brand />
-      <h1 className="mt-9 text-4xl font-semibold tracking-tight">Alan adlarınızın süresini takip edin.</h1>
-      <p className="muted mt-4 leading-relaxed">Alan adı ve TLS sertifikası bitiş tarihlerini izleyin. Süre yaklaştığında Slack’te bildirim alın.</p>
-      {initialError ? <p role="alert" className="mt-6">Sunucuya erişilemedi. <a href="/" className="underline">Yeniden yükle</a></p>
-        : user === undefined ? <p className="muted mt-6">Yükleniyor…</p>
-        : <a href="/auth/github" className="button mt-8">GitHub ile giriş yap</a>}
-      {new URLSearchParams(location.search).has('auth') && <p role="alert" className="mt-4 text-amber-300">GitHub girişi tamamlanamadı.</p>}
-    </section>
-  </main>;
-
   return <>
-    <header className="topbar"><div className="shell flex flex-wrap items-center justify-between gap-3 py-4">
+    <header className="topbar"><div className="shell py-4">
       <Brand />
-      <div className="flex items-center gap-4 text-sm"><span className="muted">@{user}</span>
-        <button className="quiet" disabled={busy} onClick={() => void run(async () => {
-          await api('/logout', 'POST');
-          location.assign('/');
-        })}>Çıkış</button>
-      </div>
     </div></header>
     <main className="shell py-10">
       <nav className="tabs" aria-label="Ana menü">

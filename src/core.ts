@@ -45,14 +45,6 @@ const encoder = new TextEncoder();
 const base64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const bytes = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
 
-export function token() {
-  return Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, '0')).join('');
-}
-
-export async function hash(value: string) {
-  return base64(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value))));
-}
-
 async function webhookKey(secret: string) {
   const decoded = bytes(secret);
   if (decoded.length !== 32) throw new Error('Invalid webhook key');
