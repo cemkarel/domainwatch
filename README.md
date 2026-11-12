@@ -35,9 +35,9 @@ Yerel Wrangler çalıştırmasında gerçek Browser Run kullanmak için `browser
 
 ### Slack
 
-**Ayarlar → Bildirim ayarları → Slack** alanına Slack'in verdiği `https://hooks.slack.com/services/…` adresini yapıştırın. Eşikleri seçin, bildirimleri etkinleştirin ve kaydedin. **Test mesajı gönder** kaydedilmiş adresle gerçek bir POST yapar ve otomatik bildirimler kapalıyken de çalışır. Test isteği ortak çalışma alanı başına sınırlandırılır. [Slack Incoming Webhooks](https://api.slack.com/incoming-webhooks)
+**Ayarlar → Bildirim ayarları → Slack** alanına Slack'in verdiği `https://hooks.slack.com/services/…` adresini yapıştırın. **Test mesajı gönder** alandaki adrese gerçek bir Slack mesajı gönderir ve ayarları kaydetmeden veya otomatik bildirimleri açmadan kullanılabilir. Eşikleri ve bildirim durumunu kaydetmek için **Kaydet** düğmesini kullanın. Test isteği ortak çalışma alanı başına sınırlandırılır. [Slack Incoming Webhooks](https://api.slack.com/incoming-webhooks)
 
-Webhook URL'si D1'e AES-256-GCM ile ve çalışma alanı sahibinin kimliğine bağlı olarak şifreli yazılır. Ayar yanıtı sabit bir maske döndürür. Boş webhook alanıyla kaydetmek mevcut değeri korur. Anahtarı değiştirirseniz webhook adresini yeniden kaydedin.
+Webhook URL'si D1'e AES-256-GCM ile ve çalışma alanı sahibinin kimliğine bağlı olarak şifreli yazılır. Admin oturumu açıkken kayıtlı adres, ayar alanında açıkça görünür. Boş webhook alanıyla kaydetmek mevcut değeri korur.
 
 ## GitHub üzerinden Cloudflare'a dağıtım
 
@@ -59,11 +59,12 @@ Deploy komutu, build'in çalıştığı hesapta `domainwatch` adlı D1 veritaban
 
 Gerekirse **Settings → Variables and Secrets** bölümünde şu değerleri girin.
 
-- Slack için `WEBHOOK_KEY` değerini secret olarak ekleyin. Yeni kurulumda `openssl rand -base64 32` ile anahtar oluşturun.
 - Eski bir hesabın listesini, bildirim geçmişini ve Slack ayarlarını ortak çalışma alanı olarak kullanmak için `WORKSPACE_OWNER_ID` değerine D1'deki `users.id` değerini girin. Şifreli Slack ayarları için önceki `WEBHOOK_KEY` değerini kullanın. Bu değişken boşken panel ve Cron yeni ortak çalışma alanını kullanır.
 - Yazma istekleri varsayılan olarak Worker'a geldikleri origin ile eşleşmelidir. `APP_ORIGIN` ayarlıysa yazma işlemleri o origin ile sınırlanır. Worker adresi değiştiğinde eski değeri kaldırın veya yeni origin ile güncelleyin.
 
-TLS kontrolü dağıtımda otomatik bağlanır. Önceki kurulumdan kalan `SCANNER_URL` ve `SCANNER_TOKEN` değerlerini kaldırabilirsiniz. Daha önce TLS tarayıcısı kullanılamadığı için sonuç alınamayan adresler, migrasyon sonrası Cron sırasına alınır.
+Dağıtım komutu ilk Slack kaydından önce eksik `WEBHOOK_KEY` değerini üretip Worker secret olarak yükler. D1'de önceden şifrelenmiş Slack adresleri varsa özgün anahtarı koruyun veya aynı değerle geri yükleyin.
+
+TLS kontrolü dağıtımda otomatik bağlanır. Önceki kurulumdan kalan `SCANNER_URL` ve `SCANNER_TOKEN` değerlerini kaldırabilirsiniz. Daha önce TLS bitiş tarihi okunamayan adresler, migrasyon sonrası Cron sırasına alınır.
 
 ## Kontrol ve bildirim davranışı
 
@@ -83,4 +84,4 @@ npm run build
 npx wrangler deploy --dry-run
 ```
 
-Otomatik testler admin girişini, oturum iptalini, çalışma alanı kapsamını, origin kontrolünü, webhook URL doğrulamasını, şifrelemeyi, maskelemeyi, Slack istek biçimini ve Cron bildirim tekrarlarını denetler. Canlı Slack mesajı için gerçek webhook yapılandırması gerekir.
+Otomatik testler admin girişini, oturum iptalini, çalışma alanı kapsamını, origin kontrolünü, webhook URL doğrulamasını, şifrelemeyi, Slack test gönderimini ve Cron bildirim tekrarlarını denetler. Canlı Slack mesajı için gerçek webhook yapılandırması gerekir.

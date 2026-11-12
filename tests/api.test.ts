@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { test } from 'node:test';
 import puppeteer, {
-  type Browser, type BrowserWorker, type HTTPRequest, type HTTPResponse, type WorkersLaunchOptions
+  type Browser, type BrowserWorker, type HTTPRequest, type WorkersLaunchOptions
 } from '@cloudflare/puppeteer';
 import worker from '../src/index.ts';
 import { day, encryptWebhook } from '../src/core.ts';
@@ -18,6 +18,8 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0002_shared_workspace.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0003_admin_auth.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0004_browser_tls.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0005_retry_unreachable_tls.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0006_webhook_key_deploy_lock.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -111,7 +113,7 @@ test('Admin login gates the API and password changes invalidate all existing ses
   assert.equal((await f.request('/auth/session')).status, 401);
 });
 
-test('The admin API uses a shared workspace, enforces same-origin mutations and masks encrypted settings', async t => {
+test('The admin API tests unsaved Slack URLs and only returns decrypted settings to the admin', async t => {
   const f = fixture();
   t.after(() => f.sql.close());
   assert.equal((await f.login()).status, 200);
@@ -136,9 +138,17 @@ test('The admin API uses a shared workspace, enforces same-origin mutations and 
   assert.equal((await f.request('/targets/legacy-id', 'DELETE')).status, 404);
   assert.equal((await f.request('/targets/' + id, 'DELETE')).status, 200);
   assert.equal((await f.request('/settings/slack/test', 'POST')).status, 400);
+  const key = f.env.WEBHOOK_KEY;
+  f.env.WEBHOOK_KEY = undefined;
+  assert.equal((await f.request('/settings/slack/test', 'POST', { url: 'https://example.com' })).status, 400);
+  assert.equal((await f.request('/settings/slack/test', 'POST', { url: webhook })).status, 200);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS count FROM notifications').get()?.count, 0);
+  f.env.WEBHOOK_KEY = key;
   assert.equal((await f.request('/settings/slack', 'PUT', { url: webhook, enabled: false, thresholds: [7] })).status, 200);
-  const settings = await (await f.request('/settings/slack')).text();
-  assert.ok(settings.includes('••••') && !settings.includes(webhook));
+  const response = await f.request('/settings/slack');
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
+  assert.equal((await response.json() as { url: string }).url, webhook);
+  assert.equal((await f.request('/settings/slack', 'GET', undefined, null, '')).status, 401);
   assert.ok(!JSON.stringify(f.sql.prepare('SELECT * FROM notifications').get()).includes(webhook));
 
   assert.equal((await f.request('/settings/slack/test', 'POST')).status, 200);
@@ -153,31 +163,42 @@ test('Adding a target saves its first RDAP and TLS results and queues alerts bef
   const domainExpiry = new Date(Date.now() + 6 * day).toISOString();
   const tlsExpiry = new Date(Math.floor((Date.now() + 3 * day) / 1000) * 1000).toISOString();
   let onRequest: (request: HTTPRequest) => Promise<void>;
-  let onResponse: (response: HTTPResponse) => void;
+  let onRedirect: (event: { redirectResponse: { url: string; remoteIPAddress: string; securityDetails: { validTo: number } } }) => void;
   const close = t.mock.fn(async () => {});
   const page = {
     setJavaScriptEnabled: async (enabled: boolean) => assert.equal(enabled, false),
+    setCacheEnabled: async (enabled: boolean) => assert.equal(enabled, false),
     setRequestInterception: async (enabled: boolean) => assert.equal(enabled, true),
-    on(event: string, listener: typeof onRequest | typeof onResponse) {
-      if (event === 'request') onRequest = listener as typeof onRequest;
-      else if (event === 'response') onResponse = listener as typeof onResponse;
+    on(_event: string, listener: typeof onRequest) {
+      onRequest = listener;
+    },
+    async createCDPSession() {
+      return {
+        send: async (command: string) => assert.equal(command, 'Network.enable'),
+        on(event: string, listener: typeof onRedirect) {
+          if (event === 'Network.requestWillBeSent') onRedirect = listener;
+        },
+        detach: async () => {}
+      };
     },
     async goto(url: string) {
       assert.equal(url, 'https://api.example.com/');
-      const request = {
+      const send = t.mock.fn(async ({ method }: { method: string }) => method);
+      await onRequest({
         url: () => url,
         isNavigationRequest: () => true,
-        continue: t.mock.fn(async ({ method }: { method: string }) => assert.equal(method, 'HEAD'))
-      };
-      await onRequest(request as unknown as HTTPRequest);
-      assert.equal(request.continue.mock.callCount(), 1);
+        continue: send
+      } as unknown as HTTPRequest);
+      assert.equal(send.mock.callCount(), 1);
+      if (send.mock.calls[0].arguments[0].method === 'HEAD') throw new Error('net::ERR_CONNECTION_RESET');
+
       const abort = t.mock.fn(async () => {});
       await onRequest({ url: () => 'https://other.example.com/', isNavigationRequest: () => true, abort } as unknown as HTTPRequest);
       assert.equal(abort.mock.callCount(), 1);
-      onResponse({
-        url: () => url, request: () => request, remoteAddress: () => ({ ip: '8.8.8.8' }),
-        securityDetails: () => ({ validTo: () => Date.parse(tlsExpiry) / 1000 })
-      } as unknown as HTTPResponse);
+      onRedirect({ redirectResponse: {
+        url, remoteIPAddress: '8.8.8.8', securityDetails: { validTo: Date.parse(tlsExpiry) / 1000 }
+      } });
+      throw new Error('net::ERR_ABORTED');
     },
     close: async () => {}
   };

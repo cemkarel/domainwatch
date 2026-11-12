@@ -7,7 +7,7 @@ interface Target {
   id: string; hostname: string; domain: string; domain_status: string; domain_expiry: string | null;
   tls_status: string; tls_expiry: string | null; checked_at: number | null;
 }
-interface Settings { configured: boolean; enabled: boolean; thresholds: number[]; maskedUrl: string | null }
+interface Settings { enabled: boolean; thresholds: number[]; url: string | null; webhookError: string | null }
 interface Alert {
   id: string; hostname: string; kind: 'tls' | 'domain'; threshold: number; state: string;
   attempts: number; last_result: string | null; updated_at: number;
@@ -179,7 +179,7 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const [settings, setSettings] = useState<Settings>();
   const [page, setPage] = useState<'targets' | 'settings' | 'alerts'>('targets');
   const [host, setHost] = useState('');
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice>();
   function showError(error: unknown) {
@@ -221,9 +221,13 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     event.preventDefault();
     if (!settings) return;
     void run(async () => {
-      await api('/settings/slack', 'PUT', { url, enabled: settings.enabled, thresholds: settings.thresholds });
-      setUrl('');
+      const updatedUrl = url?.trim();
+      await api('/settings/slack', 'PUT', {
+        url: updatedUrl === settings.url ? undefined : updatedUrl,
+        enabled: settings.enabled, thresholds: settings.thresholds
+      });
       await loadSettings();
+      setUrl(undefined);
       setNotice({ message: 'slackSaved' });
     });
   }
@@ -303,9 +307,11 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
           <div><h2 className="text-xl font-semibold">{copy.notificationSettings} · Slack</h2>
             <p className="muted mt-1">{copy.slackDescription}</p></div>
           <label>{copy.webhook}
-            <input type="password" autoComplete="off" maxLength={400} value={url}
-              placeholder={settings.maskedUrl ?? 'https://hooks.slack.com/services/…'} onChange={e => setUrl(e.target.value)} />
+            <input type="text" inputMode="url" autoComplete="off" spellCheck={false} maxLength={400}
+              value={url ?? settings.url ?? ''} placeholder="https://hooks.slack.com/services/…"
+              onChange={e => setUrl(e.target.value)} />
           </label>
+          {settings.webhookError && <p className="muted" role="status">{errorMessage(settings.webhookError, copy)}</p>}
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={settings.enabled}
               onChange={e => setSettings({ ...settings, enabled: e.target.checked })} />
@@ -323,9 +329,9 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
           </fieldset>
           <div className="flex flex-wrap gap-3">
             <button className="button" disabled={busy}>{copy.save}</button>
-            <button type="button" className="quiet" disabled={busy || !settings.configured || Boolean(url)} onClick={() =>
+            <button type="button" className="quiet" disabled={busy || !(url ?? settings.url)?.trim()} onClick={() =>
               void run(async () => {
-                await api('/settings/slack/test', 'POST');
+                await api('/settings/slack/test', 'POST', { url: url?.trim() });
                 setNotice({ message: 'testSent' });
               })}>{copy.sendTest}</button>
           </div>

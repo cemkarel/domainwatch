@@ -25,46 +25,62 @@ async function resolveAddresses(hostname: string, type: 'A' | 'AAAA') {
 
 async function scanPage(page: Page, hostname: string): Promise<Check> {
   const url = 'https://' + hostname + '/';
-  let allowRequest = true;
+  let allowRequest = false;
+  let method: 'HEAD' | 'GET' = 'HEAD';
   let expiry: string | null = null;
   await page.setJavaScriptEnabled(false);
+  await page.setCacheEnabled(false);
   await page.setRequestInterception(true);
   page.on('request', request => {
     if (allowRequest && request.isNavigationRequest() && request.url() === url) {
       allowRequest = false;
-      return request.continue({ method: 'HEAD' });
+      return request.continue({ method });
     }
     return request.abort();
   });
-  page.on('response', response => {
-    if (!response.request().isNavigationRequest() || response.url() !== url) return;
-    const address = response.remoteAddress().ip;
-    if (address && !isPublicAddress(address)) return;
-    const validTo = response.securityDetails()?.validTo();
-    if (validTo !== undefined && Number.isFinite(validTo)) expiry = new Date(validTo * 1000).toISOString();
-  });
 
-  const navigate = () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 5000 });
+  const cdp = await page.createCDPSession();
+  let untrusted = false;
   try {
-    await navigate();
-  } catch (error) {
-    if (expiry) return { status: 'ok', expiry };
-    if (!(error instanceof Error) || !/net::ERR_CERT_/.test(error.message)) {
-      return { status: 'tls_unreachable', expiry: null };
+    await cdp.send('Network.enable');
+    const readExpiry = (response: { url: string; remoteIPAddress?: string; securityDetails?: { validTo: number } }) => {
+      if (response.url !== url) return;
+      if (response.remoteIPAddress && !isPublicAddress(response.remoteIPAddress)) return;
+      const validTo = response.securityDetails?.validTo;
+      if (validTo !== undefined && Number.isFinite(validTo)) expiry = new Date(validTo * 1000).toISOString();
+    };
+    cdp.on('Network.responseReceived', event => readExpiry(event.response));
+    cdp.on('Network.requestWillBeSent', event => {
+      if (event.redirectResponse) readExpiry(event.redirectResponse);
+    });
+
+    async function navigate(requestMethod: typeof method) {
+      method = requestMethod;
+      allowRequest = true;
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 5000 });
+        return undefined;
+      } catch (error) {
+        return error instanceof Error ? /net::ERR_[A-Z_]+/.exec(error.message)?.[0] : undefined;
+      }
     }
 
-    const cdp = await page.createCDPSession();
-    await cdp.send('Security.setIgnoreCertificateErrors', { ignore: true });
-    try {
-      allowRequest = true;
-      await navigate().catch(() => {});
-      return { status: 'tls_untrusted', expiry };
-    } finally {
-      await cdp.send('Security.setIgnoreCertificateErrors', { ignore: false }).catch(() => {});
-      await cdp.detach().catch(() => {});
+    let error = await navigate('HEAD');
+    if (!expiry && !error?.startsWith('net::ERR_CERT_')) error = await navigate('GET');
+    if (!expiry && error?.startsWith('net::ERR_CERT_')) {
+      await cdp.send('Security.setIgnoreCertificateErrors', { ignore: true });
+      untrusted = true;
+      error = await navigate('HEAD');
+      if (!expiry) error = await navigate('GET');
     }
+    if (expiry || untrusted) return { status: untrusted ? 'tls_untrusted' : 'ok', expiry };
+
+    console.warn({ event: 'tls_navigation_failed', hostname, error: error ?? 'missing_certificate_details' });
+    return { status: 'tls_unreachable', expiry: null };
+  } finally {
+    if (untrusted) await cdp.send('Security.setIgnoreCertificateErrors', { ignore: false }).catch(() => {});
+    await cdp.detach().catch(() => {});
   }
-  return expiry ? { status: 'ok', expiry } : { status: 'tls_unreachable', expiry: null };
 }
 
 async function launchBrowser(binding: BrowserWorker, hostnames: string[]) {

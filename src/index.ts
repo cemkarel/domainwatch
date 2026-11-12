@@ -83,10 +83,22 @@ function settings(env: Env, id: string) {
 }
 
 api.get('/settings/slack', async c => {
-  const row = await settings(c.env, workspaceOwnerId(c.env));
+  const user = workspaceOwnerId(c.env);
+  const row = await settings(c.env, user);
+  let url: string | null = null;
+  let webhookError: string | null = null;
+  if (row) {
+    if (!c.env.WEBHOOK_KEY) webhookError = 'encryption_unconfigured';
+    else {
+      try {
+        url = await decryptWebhook(row.encrypted_url, c.env.WEBHOOK_KEY, user);
+      } catch {
+        webhookError = 'webhook_decryption_error';
+      }
+    }
+  }
   return c.json({ configured: Boolean(row), enabled: Boolean(row?.enabled),
-    thresholds: row ? JSON.parse(row.thresholds) : thresholds,
-    maskedUrl: row ? 'https://hooks.slack.com/services/••••/••••/••••' : null });
+    thresholds: row ? JSON.parse(row.thresholds) : thresholds, url, webhookError });
 });
 
 api.put('/settings/slack', async c => {
@@ -120,10 +132,22 @@ api.post('/settings/slack/test', async c => {
   const user = workspaceOwnerId(c.env);
   const allowed = await c.env.TEST_LIMIT.limit({ key: user });
   if (!allowed.success) return c.json({ error: 'rate_limited' }, 429);
-  const row = await settings(c.env, user);
-  if (!row) return c.json({ error: 'webhook_required' }, 400);
-  if (!c.env.WEBHOOK_KEY) return c.json({ error: 'encryption_unconfigured' }, 503);
-  const url = await decryptWebhook(row.encrypted_url, c.env.WEBHOOK_KEY, user);
+  const input = c.req.raw.body ? await c.req.json().catch(() => null) : {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return c.json({ error: 'invalid_webhook' }, 400);
+  let url: string | null;
+  if (input.url !== undefined && input.url !== '') {
+    url = webhookUrl(input.url);
+    if (!url) return c.json({ error: 'invalid_webhook' }, 400);
+  } else {
+    const row = await settings(c.env, user);
+    if (!row) return c.json({ error: 'webhook_required' }, 400);
+    if (!c.env.WEBHOOK_KEY) return c.json({ error: 'encryption_unconfigured' }, 503);
+    try {
+      url = await decryptWebhook(row.encrypted_url, c.env.WEBHOOK_KEY, user);
+    } catch {
+      return c.json({ error: 'webhook_decryption_error' }, 503);
+    }
+  }
   const result = await sendSlack(url, 'DomainWatch · Test message. Your Slack webhook is working.');
   console.log({ event: 'slack_test', result: result.result });
   return result.ok ? c.json({ ok: true }) : c.json({ error: result.result }, 502);
