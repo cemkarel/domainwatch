@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { X509Certificate } from 'node:crypto';
 import { test } from 'node:test';
+import { rootCertificates } from 'node:tls';
+import puppeteer, { type Browser } from '@cloudflare/puppeteer';
 import { checkDomain } from '../src/checks.ts';
 import { tlsChecks } from '../src/tls.ts';
 
@@ -28,4 +31,49 @@ test('TLS checks reject a host with non-public DNS answers before launching a br
   const checks = tlsChecks({ fetch: async () => { throw new Error('Unexpected browser launch'); } }, ['api.example.com']);
   assert.deepEqual(await checks.check('api.example.com'), { status: 'no_public_address', expiry: null });
   await checks.close();
+});
+
+test('TLS checks can read the leaf certificate when the HTTP event omits its expiry', async t => {
+  const certificate = new X509Certificate(rootCertificates[0]);
+  const origin = 'https://api.example.com';
+  let recovered = true;
+  let onResponse: (event: { response: { url: string; remoteIPAddress: string } }) => void;
+  const page = {
+    setJavaScriptEnabled: async () => {},
+    setCacheEnabled: async () => {},
+    setRequestInterception: async () => {},
+    on() {},
+    async createCDPSession() {
+      return {
+        async send(command: string, params?: { origin: string }) {
+          if (command === 'Network.enable') return;
+          assert.equal(command, 'Network.getCertificate');
+          assert.equal(params?.origin, origin);
+          return { tableNames: recovered ? [certificate.raw.toString('base64')] : [] };
+        },
+        on(event: string, listener: typeof onResponse) {
+          if (event === 'Network.responseReceived') onResponse = listener;
+        },
+        detach: async () => {}
+      };
+    },
+    async goto(url: string) {
+      onResponse({ response: { url, remoteIPAddress: '8.8.8.8' } });
+    },
+    close: async () => {}
+  };
+  t.mock.method(puppeteer, 'launch', async () => ({ newPage: async () => page, close: async () => {} }) as unknown as Browser);
+  t.mock.method(globalThis, 'fetch', async (url: URL) => Response.json({
+    Status: 0, Answer: url.searchParams.get('type') === 'A' ? [{ type: 1, data: '8.8.8.8' }] : []
+  }));
+  const checks = tlsChecks({ fetch }, ['api.example.com']);
+  try {
+    assert.deepEqual(await checks.check('api.example.com'), {
+      status: 'tls_untrusted', expiry: new Date(certificate.validTo).toISOString()
+    });
+    recovered = false;
+    assert.deepEqual(await checks.check('api.example.com'), { status: 'tls_certificate_unavailable', expiry: null });
+  } finally {
+    await checks.close();
+  }
 });

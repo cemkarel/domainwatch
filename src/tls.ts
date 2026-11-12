@@ -1,3 +1,5 @@
+import { Buffer } from 'node:buffer';
+import { X509Certificate } from 'node:crypto';
 import puppeteer, { type Browser, type BrowserWorker, type Page } from '@cloudflare/puppeteer';
 import ipaddr from 'ipaddr.js';
 import type { Check } from './checks.ts';
@@ -26,15 +28,17 @@ async function resolveAddresses(hostname: string, type: 'A' | 'AAAA') {
 async function scanPage(page: Page, hostname: string): Promise<Check> {
   const url = 'https://' + hostname + '/';
   let allowRequest = false;
-  let method: 'HEAD' | 'GET' = 'HEAD';
+  let method: 'HEAD' | 'GET' = 'GET';
   let expiry: string | null = null;
+  let receivedResponse = false;
+  let nonPublicPeer = false;
   await page.setJavaScriptEnabled(false);
   await page.setCacheEnabled(false);
   await page.setRequestInterception(true);
   page.on('request', request => {
     if (allowRequest && request.isNavigationRequest() && request.url() === url) {
       allowRequest = false;
-      return request.continue({ method });
+      return method === 'GET' ? request.continue() : request.continue({ method });
     }
     return request.abort();
   });
@@ -45,7 +49,11 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
     await cdp.send('Network.enable');
     const readExpiry = (response: { url: string; remoteIPAddress?: string; securityDetails?: { validTo: number } }) => {
       if (response.url !== url) return;
-      if (response.remoteIPAddress && !isPublicAddress(response.remoteIPAddress)) return;
+      if (response.remoteIPAddress && !isPublicAddress(response.remoteIPAddress)) {
+        nonPublicPeer = true;
+        return;
+      }
+      receivedResponse = true;
       const validTo = response.securityDetails?.validTo;
       if (validTo !== undefined && Number.isFinite(validTo)) expiry = new Date(validTo * 1000).toISOString();
     };
@@ -61,22 +69,40 @@ async function scanPage(page: Page, hostname: string): Promise<Check> {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 5000 });
         return undefined;
       } catch (error) {
-        return error instanceof Error ? /net::ERR_[A-Z_]+/.exec(error.message)?.[0] : undefined;
+        return error instanceof Error ? /net::ERR_[A-Z_]+/.exec(error.message)?.[0] ?? error.name : undefined;
       }
     }
 
-    let error = await navigate('HEAD');
-    if (!expiry && !error?.startsWith('net::ERR_CERT_')) error = await navigate('GET');
+    let error = await navigate('GET');
+    if (!expiry && !error?.startsWith('net::ERR_CERT_')) error = await navigate('HEAD');
     if (!expiry && error?.startsWith('net::ERR_CERT_')) {
       await cdp.send('Security.setIgnoreCertificateErrors', { ignore: true });
       untrusted = true;
-      error = await navigate('HEAD');
-      if (!expiry) error = await navigate('GET');
+      error = await navigate('GET');
+      if (!expiry) error = await navigate('HEAD');
+    }
+    if (nonPublicPeer) return { status: 'no_public_address', expiry: null };
+    if (!expiry) {
+      try {
+        const { tableNames: [leaf] } = await cdp.send('Network.getCertificate', { origin: 'https://' + hostname });
+        if (leaf) {
+          const certificate = new X509Certificate(Buffer.from(leaf, 'base64'));
+          const validTo = Date.parse(certificate.validTo);
+          if (Number.isFinite(validTo)) {
+            expiry = new Date(validTo).toISOString();
+            const now = Date.now();
+            untrusted ||= validTo <= now || Date.parse(certificate.validFrom) > now || !certificate.checkHost(hostname);
+          }
+        }
+      } catch {
+        // This optional CDP command may be unavailable on some browser versions.
+      }
     }
     if (expiry || untrusted) return { status: untrusted ? 'tls_untrusted' : 'ok', expiry };
 
-    console.warn({ event: 'tls_navigation_failed', hostname, error: error ?? 'missing_certificate_details' });
-    return { status: 'tls_unreachable', expiry: null };
+    const status = receivedResponse ? 'tls_certificate_unavailable' : 'tls_unreachable';
+    console.warn({ event: 'tls_navigation_failed', hostname, status, error: error ?? 'missing_certificate_details' });
+    return { status, expiry: null };
   } finally {
     if (untrusted) await cdp.send('Security.setIgnoreCertificateErrors', { ignore: false }).catch(() => {});
     await cdp.detach().catch(() => {});

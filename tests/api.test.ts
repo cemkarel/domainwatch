@@ -20,6 +20,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0004_browser_tls.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0005_retry_unreachable_tls.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0006_webhook_key_deploy_lock.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0007_retry_tls_certificate_checks.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -183,14 +184,14 @@ test('Adding a target saves its first RDAP and TLS results and queues alerts bef
     },
     async goto(url: string) {
       assert.equal(url, 'https://api.example.com/');
-      const send = t.mock.fn(async ({ method }: { method: string }) => method);
+      const send = t.mock.fn(async (overrides?: { method: string }) => overrides?.method);
       await onRequest({
         url: () => url,
         isNavigationRequest: () => true,
         continue: send
       } as unknown as HTTPRequest);
       assert.equal(send.mock.callCount(), 1);
-      if (send.mock.calls[0].arguments[0].method === 'HEAD') throw new Error('net::ERR_CONNECTION_RESET');
+      if (!send.mock.calls[0].arguments[0]) throw new Error('net::ERR_CONNECTION_RESET');
 
       const abort = t.mock.fn(async () => {});
       await onRequest({ url: () => 'https://other.example.com/', isNavigationRequest: () => true, abort } as unknown as HTTPRequest);
@@ -266,9 +267,9 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   f.seedLegacyTarget();
   f.sql.prepare(`
     INSERT INTO targets (id,user_id,hostname,domain,tls_status,next_check)
-    VALUES ('pending-id','shared','api.example.com','example.com','scanner_unconfigured',?)
+    VALUES ('pending-id','shared','api.example.com','example.com','tls_unreachable',?)
   `).run(Date.now() + day);
-  f.sql.exec(readFileSync(new URL('../migrations/0004_browser_tls.sql', import.meta.url), 'utf8'));
+  f.sql.exec(readFileSync(new URL('../migrations/0007_retry_tls_certificate_checks.sql', import.meta.url), 'utf8'));
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });
   const expiry = new Date(Date.now() + 6 * day).toISOString();
   let slackRequests = 0;
