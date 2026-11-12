@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer';
 import { X509Certificate } from 'node:crypto';
 import puppeteer, { type Browser, type BrowserWorker, type Page } from '@cloudflare/puppeteer';
 import ipaddr from 'ipaddr.js';
-import type { Check } from './checks.ts';
+import { expiryDate, type Check } from './checks.ts';
 import { normalizeHost } from './core.ts';
 import { boundedJson } from './network.ts';
 
@@ -29,6 +29,27 @@ async function resolveAddresses(hostname: string, type: 'A' | 'AAAA') {
   const data = await boundedJson(response, 16_384) as { Status: number; Answer?: { type: number; data: string }[] };
   if (data.Status !== 0 && data.Status !== 3) throw new Error('DNS lookup failed');
   return (data.Answer ?? []).filter(answer => answer.type === (type === 'A' ? 1 : 28)).map(answer => answer.data);
+}
+
+async function checkCertificateApi(hostname: string): Promise<Check | null> {
+  const url = new URL('https://api.domainee.dev/v1/tools/ssl-check');
+  url.searchParams.set('host', hostname);
+  try {
+    const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(9000) });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return null;
+    }
+    const { ok, data } = await boundedJson(response, 32_768) as {
+      ok?: boolean; data?: { host?: string; port?: number; authorized?: boolean; validTo?: string };
+    };
+    if (ok !== true || data?.host !== hostname || data.port !== 443 || typeof data.authorized !== 'boolean') return null;
+    const expiry = expiryDate(data.validTo);
+    if (!expiry) return null;
+    return { status: data.authorized && Date.parse(expiry) > Date.now() ? 'ok' : 'tls_untrusted', expiry };
+  } catch {
+    return null;
+  }
 }
 
 async function scanPage(page: Page, hostname: string): Promise<Check> {
@@ -127,7 +148,6 @@ export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[
   let closed = false;
   return {
     async check(hostname: string): Promise<Check> {
-      if (!binding) return { status: 'scanner_unconfigured', expiry: null };
       if (normalizeHost(hostname)?.hostname !== hostname) return { status: 'no_public_address', expiry: null };
       try {
         const [ipv4, ipv6] = await Promise.all([resolveAddresses(hostname, 'A'), resolveAddresses(hostname, 'AAAA')]);
@@ -137,6 +157,9 @@ export function tlsChecks(binding: BrowserWorker | undefined, hostnames: string[
           return { status: 'no_public_address', expiry: null };
         }
 
+        const apiResult = await checkCertificateApi(hostname);
+        if (apiResult) return apiResult;
+        if (!binding) return { status: 'scanner_unconfigured', expiry: null };
         if (closed) return { status: 'scanner_error', expiry: null };
         browser ??= puppeteer.launch(binding, { guardrails: { allowedDomains: [...new Set(hostnames)] } });
         const session = await browser;

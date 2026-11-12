@@ -56,7 +56,7 @@ async function checkTarget(
   });
   const [domain, tls] = await Promise.all([
     domainCheck,
-    settleWithin<Check>(checkTls(target.hostname), 18_000, { status: 'scanner_timeout', expiry: null })
+    settleWithin<Check>(checkTls(target.hostname), 22_000, { status: 'scanner_timeout', expiry: null })
   ]);
   const checked = Date.now();
   const statements = [

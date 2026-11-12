@@ -1,6 +1,6 @@
 # DomainWatch
 
-Ortak takip listesi ve Slack ayarları olan bir alan adı ve HTTPS sertifikası takip uygulaması. React ve Tailwind arayüzü, Hono API, D1 ve Cron aynı Cloudflare Worker dağıtımında çalışır. Canlı TLS sertifikası kontrolü Cloudflare Browser Run üzerinden yapılır.
+Ortak takip listesi ve Slack ayarları olan bir alan adı ve HTTPS sertifikası takip uygulaması. React ve Tailwind arayüzü, Hono API, D1 ve Cron aynı Cloudflare Worker dağıtımında çalışır. Canlı TLS sertifikası kontrolü Domainee'nin herkese açık API'sini kullanır. Cloudflare Browser Run yedek olarak çalışır.
 
 Panelin sağ üstünden Türkçe veya İngilizce seçilebilir. Dil tercihi tarayıcıda saklanır.
 
@@ -29,7 +29,7 @@ curl -fsS 'http://localhost:8787/cdn-cgi/local/scheduled?format=json&cron=*/5+*+
 
 ### Canlı HTTPS sertifikası
 
-`wrangler.jsonc` içindeki `TLS_BROWSER` bağlantısı, Worker dağıtılırken Cloudflare Browser Run'a bağlanır. Worker, hedefin genel DNS kayıtlarını kontrol eder ve HTTPS yanıtındaki sertifikanın bitiş tarihini okur. Her cron turu bir tarayıcı oturumunu paylaşır. Sertifika ve zincir doğrulaması başarısız olursa, okunabilen bitiş tarihi **Sertifika güvenilir değil** durumuyla gösterilir. CDN'in sunduğu sertifika bağlantının yapıldığı konuma göre değişebilir. [Cloudflare Browser Run](https://developers.cloudflare.com/browser-run/puppeteer/) · [Plan limitleri](https://developers.cloudflare.com/browser-run/limits/)
+`wrangler.jsonc` içindeki `TLS_BROWSER` bağlantısı, Worker dağıtılırken Cloudflare Browser Run'a bağlanır. Worker, hedefin genel DNS kayıtlarını kontrol eder ve sertifika tarihini öğrenmek için yalnızca alan adını Domainee API’sine gönderir. API yanıt veremezse HTTPS bağlantısını Browser Run ile kontrol eder. Domainee API anahtarı gerektirmez ve IP başına kullanım sınırı uygular. [Domainee TLS API](https://domainee.dev/docs/free-apis/ssl-certificate-checker) Her cron turu bir tarayıcı oturumunu paylaşır. Sertifika ve zincir doğrulaması başarısız olursa, okunabilen bitiş tarihi **Sertifika güvenilir değil** durumuyla gösterilir. CDN'in sunduğu sertifika bağlantının yapıldığı konuma göre değişebilir. [Cloudflare Browser Run](https://developers.cloudflare.com/browser-run/puppeteer/) · [Plan limitleri](https://developers.cloudflare.com/browser-run/limits/)
 
 Yerel Wrangler çalıştırmasında gerçek Browser Run kullanmak için `browser` yapılandırmasına geçici olarak `"remote": true` ekleyin ve Cloudflare hesabınıza giriş yapın. Bu yerel test hesabınızın Browser Run kotasını kullanır. [Yerel test](https://developers.cloudflare.com/browser-run/faq/)
 
@@ -69,7 +69,7 @@ TLS kontrolü dağıtımda otomatik bağlanır. Önceki kurulumdan kalan `SCANNE
 ## Kontrol ve bildirim davranışı
 
 - RDAP için Public Suffix List ile kayıt edilebilir alan adı bulunur. IANA'nın bootstrap listesi, TLD'nin HTTPS RDAP adreslerini belirler. İlk adres başarısızsa sıradaki denenir. `.com`, `.net` ve `.org` için kayıt operatörü adresleri ek fallback olarak tanımlıdır. RDAP desteği, kayıt bulunamaması, tarihin paylaşılmaması ve bağlantı hatası ayrı durumlar olarak görünür. [IANA RDAP bootstrap](https://data.iana.org/rdap/dns.json)
-- Yeni adres eklenince ilk RDAP ve TLS kontrolleri arka planda başlar. Alan adı bitişi hazır olduğunda listede görünür. TLS kontrolü 18 saniye içinde tamamlanamazsa zaman aşımı durumu gösterilir. İlk kontrol yarıda kesilirse adres Cron tarafından tekrar alınır.
+- Yeni adres eklenince ilk RDAP ve TLS kontrolleri arka planda başlar. Alan adı bitişi hazır olduğunda listede görünür. TLS kontrolü 22 saniye içinde tamamlanamazsa zaman aşımı durumu gösterilir. İlk kontrol yarıda kesilirse adres Cron tarafından tekrar alınır.
 - Her tamamlanan kontrolden 24 saat sonra adres yeniden kontrol için uygun hale gelir. Cron beş dakikada bir, aktif çalışma alanında süresi gelen en fazla iki adresi ve dört bildirimi işler. MVP sınırı çalışma alanı başına 25 ve veritabanında toplam 400 adrestir. Trafik ve Cron CPU kullanımı gerçek dağıtımda gözlemlenmelidir. [Workers limitleri](https://developers.cloudflare.com/workers/platform/limits/) · [D1 fiyatlandırması](https://developers.cloudflare.com/d1/platform/pricing/)
 - 30/14/7/3/1 günlük pencerelerden en yakın seçili eşiğe bildirim yazılır. Örneğin ilk kontrolde 5 gün kaldıysa 7 günlük bildirim hazırlanır. D1'de adres, tarih türü, bitiş tarihi ve eşik kombinasyonu tekrar planlamayı önler.
 - Ağ hataları, Slack 429 ve 5xx yanıtları artan bekleme süresiyle beş denemeye kadar yeniden denenir. Ayarı değişmiş veya güncel bitiş tarihi artık eşleşmeyen bekleyen bildirimler iptal edilir. Slack'in kabul ettiği isteğin yanıtı kaybolursa nadiren tekrar mesaj oluşabilir. Son teslim sonucu D1'de, denemeler yapılandırılmış Worker loglarında tutulur.

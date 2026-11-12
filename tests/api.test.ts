@@ -23,6 +23,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0007_retry_tls_certificate_checks.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0008_retry_tls_dns_status.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0009_retry_pending_checks.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0010_retry_tls_with_certificate_api.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -232,6 +233,7 @@ test('Adding a target returns before TLS and publishes RDAP while the TLS check 
       const Answer = url.searchParams.get('type') === 'A' ? [{ type: 1, data: '8.8.8.8' }] : [];
       return Response.json({ Status: 0, Answer });
     }
+    if (url instanceof URL && url.hostname === 'api.domainee.dev') return new Response(null, { status: 429 });
     throw new Error('Unexpected URL ' + url);
   });
 
@@ -255,7 +257,7 @@ test('Adding a target returns before TLS and publishes RDAP while the TLS check 
   const alerts = f.sql.prepare('SELECT kind FROM alerts WHERE target_id=? ORDER BY kind').all(id);
   assert.deepEqual(alerts.map(alert => alert.kind), ['domain', 'tls']);
   assert.equal((await f.request('/targets', 'POST', { hostname: 'api.example.com' })).status, 409);
-  assert.equal(fetchMock.mock.callCount(), 4);
+  assert.equal(fetchMock.mock.callCount(), 5);
   assert.equal(launch.mock.callCount(), 1);
   assert.equal(close.mock.callCount(), 1);
 });
@@ -298,6 +300,15 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
       rdapRequests++;
       return Response.json({ objectClassName: 'domain', events: [{ eventAction: 'expiration', eventDate: expiry }] });
     }
+    if (url instanceof URL && url.hostname === 'cloudflare-dns.com') {
+      return Response.json({ Status: 0, Answer: [{ type: 1, data: '8.8.8.8' }] });
+    }
+    if (url instanceof URL && url.hostname === 'api.domainee.dev') {
+      assert.equal(url.searchParams.get('host'), 'api.example.com');
+      return Response.json({ ok: true, data: {
+        host: 'api.example.com', port: 443, authorized: true, validTo: new Date(Date.now() + 90 * day).toISOString()
+      } });
+    }
     if (url === webhook) return new Response('ok', { status: ++slackRequests === 1 ? 429 : 200 });
     throw new Error('Unexpected URL ' + url);
   });
@@ -305,7 +316,7 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   await scheduled(f.env);
   const target = f.sql.prepare("SELECT domain_expiry, tls_status FROM targets WHERE user_id='shared'").get();
   assert.equal(target?.domain_expiry, expiry);
-  assert.equal(target?.tls_status, 'scanner_unconfigured');
+  assert.equal(target?.tls_status, 'ok');
   assert.equal(f.sql.prepare("SELECT checked_at FROM targets WHERE id='legacy-id'").get()?.checked_at, null);
   await scheduled(f.env);
   assert.equal(rdapRequests, 1);
