@@ -48,15 +48,10 @@ api.post('/targets', async c => {
   const id = crypto.randomUUID();
   const result = await c.env.DB.prepare(`
     INSERT INTO targets(id,user_id,hostname,domain)
-    SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM targets WHERE user_id=?)<25
-      AND (SELECT COUNT(*) FROM targets)<400
+    VALUES (?,?,?,?)
     ON CONFLICT(user_id,hostname) DO NOTHING
-  `).bind(id, user, host.hostname, host.domain, user).run();
-  if (!result.meta.changes) {
-    const duplicate = await c.env.DB.prepare('SELECT id FROM targets WHERE user_id=? AND hostname=?')
-      .bind(user, host.hostname).first();
-    return c.json({ error: duplicate ? 'duplicate_hostname' : 'target_limit' }, 409);
-  }
+  `).bind(id, user, host.hostname, host.domain).run();
+  if (!result.meta.changes) return c.json({ error: 'duplicate_hostname' }, 409);
   c.executionCtx.waitUntil(checkNewTarget(c.env, id).catch(() => {
     console.error({ event: 'first_check_failed', targetId: id });
   }));

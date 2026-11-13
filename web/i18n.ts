@@ -78,7 +78,6 @@ const tr = {
   errors: {
     invalid_hostname: 'example.com biçiminde bir alan adı veya alt alan adı girin.',
     duplicate_hostname: 'Bu adres zaten listenizde.',
-    target_limit: 'Takip sınırına ulaşıldı.',
     invalid_webhook: 'Geçerli bir Slack webhook adresi girin.',
     invalid_origin: 'Bu adresten değişiklik yapılamıyor.',
     invalid_credentials: 'Kullanıcı adı veya parola yanlış.',
@@ -181,7 +180,6 @@ const en: Copy = {
   errors: {
     invalid_hostname: 'Enter a domain or subdomain such as example.com.',
     duplicate_hostname: 'This address is already on the watchlist.',
-    target_limit: 'The watchlist limit has been reached.',
     invalid_webhook: 'Enter a valid Slack webhook URL.',
     invalid_origin: 'Changes cannot be made from this origin.',
     invalid_credentials: 'The username or password is incorrect.',

@@ -119,6 +119,28 @@ test('Admin login gates the API and password changes invalidate all existing ses
   assert.equal((await f.request('/auth/session')).status, 401);
 });
 
+test('The watchlist accepts more than 400 addresses and rejects duplicates', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  assert.equal((await f.login()).status, 200);
+  const insert = f.sql.prepare("INSERT INTO targets (id,user_id,hostname,domain) VALUES (?,'shared',?,?)");
+  for (let i = 0; i < 400; i++) {
+    const hostname = `site-${i}.example.com`;
+    insert.run(hostname, hostname, 'example.com');
+  }
+  t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 503 }));
+
+  const hostname = 'site-400.example.com';
+  assert.equal((await f.request('/targets', 'POST', { hostname })).status, 201);
+  await f.completeChecks();
+  const duplicate = await f.request('/targets', 'POST', { hostname });
+  assert.equal(duplicate.status, 409);
+  assert.deepEqual(await duplicate.json(), { error: 'duplicate_hostname' });
+  const targets = await (await f.request('/targets')).json() as { hostname: string }[];
+  assert.equal(targets.length, 401);
+  assert.ok(targets.some(target => target.hostname === hostname));
+});
+
 test('The admin API tests unsaved Slack URLs and only returns decrypted settings to the admin', async t => {
   const f = fixture();
   t.after(() => f.sql.close());
