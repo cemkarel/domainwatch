@@ -53,12 +53,21 @@ api.get('/targets/page', async c => {
   const search = c.req.query('q')?.trim().toLowerCase() ?? '';
   const sort = c.req.query('sort');
   const order = sort === 'domain_expiry' || sort === 'tls_expiry' ? `${sort} ASC NULLS LAST, hostname` : 'hostname';
-  const filter = search ? ' AND (instr(hostname, ?) > 0 OR instr(domain, ?) > 0)' : '';
-  const { results } = await c.env.DB.prepare(`
-    SELECT ${targetColumns} FROM targets WHERE user_id=?${filter}
-    ORDER BY ${order} LIMIT ? OFFSET ?
-  `).bind(workspaceOwnerId(c.env), ...(search ? [search, search] : []), targetPageSize + 1, offset).all();
-  return c.json({ targets: results.slice(0, targetPageSize), hasNext: results.length > targetPageSize });
+  const matches = '(instr(hostname, ?) > 0 OR instr(domain, ?) > 0)';
+  const user = workspaceOwnerId(c.env);
+  const searchParams = search ? [search, search] : [];
+  const [rows, counts] = await c.env.DB.batch([
+    c.env.DB.prepare(`
+      SELECT ${targetColumns} FROM targets WHERE user_id=?${search ? ` AND ${matches}` : ''}
+      ORDER BY ${order} LIMIT ? OFFSET ?
+    `).bind(user, ...searchParams, targetPageSize, offset),
+    c.env.DB.prepare(`
+      SELECT COUNT(*) AS total, COUNT(*) ${search ? `FILTER (WHERE ${matches})` : ''} AS matched
+      FROM targets WHERE user_id=?
+    `).bind(...searchParams, user)
+  ]);
+  const { total, matched } = counts.results[0] as { total: number; matched: number };
+  return c.json({ targets: rows.results, hasNext: offset + rows.results.length < matched, total, matched });
 });
 
 api.post('/targets', async c => {

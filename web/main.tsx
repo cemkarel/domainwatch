@@ -7,7 +7,7 @@ interface Target {
   id: string; hostname: string; domain: string; domain_status: string; domain_expiry: string | null;
   tls_enabled: number; tls_status: string; tls_expiry: string | null; checked_at: number | null;
 }
-interface TargetPage { targets: Target[]; hasNext: boolean }
+interface TargetPage { targets: Target[]; hasNext: boolean; total: number; matched: number }
 interface Settings { enabled: boolean; thresholds: number[]; url: string | null; webhookError: string | null }
 interface BulkResult { added: number; duplicates: number; invalid: string[] }
 type TargetSort = 'hostname' | 'domain_expiry' | 'tls_expiry';
@@ -400,15 +400,21 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
               : query ? copy.noMatchingTargets : copy.emptyTargets}
           </p>}
         </section>
-        {(targetPage > 1 || currentWatchlist?.data?.hasNext) && <nav className="mt-3 flex items-center justify-end gap-3"
-          aria-label={copy.targetPagination}>
-          <button className="quiet" disabled={busy || targetPage === 1} onClick={() => setTargetPage(current => current - 1)}>
-            {copy.previousPage}
-          </button>
-          <span className="muted text-sm" role="status">{copy.pageNumber(targetPage)}</span>
-          <button className="quiet" disabled={busy || !currentWatchlist?.data?.hasNext}
-            onClick={() => setTargetPage(current => current + 1)}>{copy.nextPage}</button>
-        </nav>}
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+          {currentWatchlist?.data && <p className="muted text-sm" role="status">
+            {copy.totalTargets(currentWatchlist.data.total)}
+            {query && <> · {copy.matchingTargets(currentWatchlist.data.matched)}</>}
+          </p>}
+          {(targetPage > 1 || currentWatchlist?.data?.hasNext) && <nav className="ml-auto flex items-center gap-3"
+            aria-label={copy.targetPagination}>
+            <button className="quiet" disabled={busy || targetPage === 1} onClick={() => setTargetPage(current => current - 1)}>
+              {copy.previousPage}
+            </button>
+            <span className="muted text-sm" role="status">{copy.pageNumber(targetPage)}</span>
+            <button className="quiet" disabled={busy || !currentWatchlist?.data?.hasNext}
+              onClick={() => setTargetPage(current => current + 1)}>{copy.nextPage}</button>
+          </nav>}
+        </div>
       </>}
       {page === 'settings' && <>
         <h1 className="mt-8">{copy.settings}</h1>

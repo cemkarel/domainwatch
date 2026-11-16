@@ -29,6 +29,10 @@ const targetQuery = `
   FROM targets t LEFT JOIN notifications n USING(user_id)
 `;
 
+const scheduledCheckLimit = 10;
+// Leave time for the last lookup and browser cleanup before the next minute.
+const scheduledCheckStartWindow = 35_000;
+
 async function settleWithin<T>(operation: Promise<T>, ms: number, fallback: T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -107,13 +111,14 @@ export async function checkNewTarget(env: Env, id: string) {
 
 async function checks(env: Env, now: number) {
   const { results } = await env.DB.prepare(targetQuery + `
-    WHERE t.user_id=? AND t.next_check<=? ORDER BY t.next_check, t.id LIMIT 2
-  `).bind(workspaceOwnerId(env), now).all<Target>();
+    WHERE t.user_id=? AND t.next_check<=? ORDER BY t.next_check, t.id LIMIT ?
+  `).bind(workspaceOwnerId(env), now, scheduledCheckLimit).all<Target>();
   let bootstrap: ReturnType<typeof rdapBootstrap> | undefined;
   const loadBootstrap = () => bootstrap ??= rdapBootstrap();
   const tls = tlsChecks(env.TLS_BROWSER, results.filter(target => target.tls_enabled).map(target => target.hostname));
   try {
     for (const target of results) {
+      if (Date.now() - now >= scheduledCheckStartWindow) break;
       await checkTarget(env, target, tls.check, loadBootstrap);
     }
   } finally {

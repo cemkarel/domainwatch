@@ -33,7 +33,11 @@ function fixture() {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
       first: async () => sql.prepare(query).get(...params) ?? null,
       all: async () => ({ results: sql.prepare(query).all(...params) }),
-      run: async () => ({ meta: sql.prepare(query).run(...params) })
+      run: async () => {
+        const statement = sql.prepare(query);
+        return /^\s*SELECT\b/i.test(query) ? { results: statement.all(...params), meta: { changes: 0 } }
+          : { results: [], meta: statement.run(...params) };
+      }
     };
   }
   const limit = async () => ({ success: true });
@@ -162,16 +166,21 @@ test('Watchlist pagination searches and sorts the workspace before selecting a p
   async function watchlist(query = '') {
     const response = await f.request('/targets/page' + query);
     assert.equal(response.status, 200);
-    const { targets, hasNext } = await response.json() as { targets: { hostname: string }[]; hasNext: boolean };
-    return { hosts: targets.map(target => target.hostname), hasNext };
+    const { targets, hasNext, total, matched } = await response.json() as {
+      targets: { hostname: string }[]; hasNext: boolean; total: number; matched: number;
+    };
+    return { hosts: targets.map(target => target.hostname), hasNext, total, matched };
   }
 
-  assert.deepEqual(await watchlist(), { hosts: hosts.slice(0, 25), hasNext: true });
-  assert.deepEqual(await watchlist('?page=2'), { hosts: hosts.slice(25), hasNext: false });
-  assert.deepEqual(await watchlist('?q=SITE-27'), { hosts: [hosts[27]], hasNext: false });
-  assert.deepEqual(await watchlist('?q=example.org'), { hosts: [], hasNext: false });
-  assert.deepEqual(await watchlist('?sort=domain_expiry'), { hosts: [hosts[26], ...hosts.slice(0, 24)], hasNext: true });
-  assert.deepEqual(await watchlist('?page=2&sort=tls_expiry&q=example.com'), { hosts: hosts.slice(24, 27), hasNext: false });
+  const counts = { total: 28, matched: 28 };
+  assert.deepEqual(await watchlist(), { hosts: hosts.slice(0, 25), hasNext: true, ...counts });
+  assert.deepEqual(await watchlist('?page=2'), { hosts: hosts.slice(25), hasNext: false, ...counts });
+  assert.deepEqual(await watchlist('?q=SITE-27'), { hosts: [hosts[27]], hasNext: false, total: 28, matched: 1 });
+  assert.deepEqual(await watchlist('?q=example.org'), { hosts: [], hasNext: false, total: 28, matched: 0 });
+  assert.deepEqual(await watchlist('?sort=domain_expiry'), { hosts: [hosts[26], ...hosts.slice(0, 24)], hasNext: true, ...counts });
+  assert.deepEqual(await watchlist('?page=2&sort=tls_expiry&q=example.com'), { hosts: hosts.slice(24, 27), hasNext: false, ...counts });
+  assert.equal((await f.request(`/targets/${hosts[27]}`, 'DELETE')).status, 200);
+  assert.deepEqual(await watchlist('?q=SITE-27'), { hosts: [], hasNext: false, total: 27, matched: 0 });
   assert.equal((await f.request('/targets/page?page=-1')).status, 400);
 });
 
@@ -368,6 +377,26 @@ test('A configured workspace owner reuses legacy targets and encrypted Slack set
     return new Response('ok');
   });
   assert.equal((await f.request('/settings/slack/test', 'POST')).status, 200);
+});
+
+test('Cron drains up to ten bulk entries per run and schedules their next checks for the next day', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  assert.equal((await f.login()).status, 200);
+  const hostnames = Array.from({ length: 11 }, (_, index) => `site-${index}.example.com`).join('\n');
+  assert.equal((await f.request('/targets/bulk', 'POST', { hostnames })).status, 200);
+  t.mock.method(globalThis, 'fetch', async (url: string | URL) => {
+    if (url === 'https://data.iana.org/rdap/dns.json') {
+      return Response.json({ services: [[['com'], ['https://rdap.example.com/']]] });
+    }
+    assert.equal(String(url), 'https://rdap.example.com/domain/example.com');
+    return Response.json({ objectClassName: 'domain', events: [] });
+  });
+
+  await scheduled(f.env);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS count FROM targets WHERE checked_at IS NOT NULL').get()?.count, 10);
+  await scheduled(f.env);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS count FROM targets WHERE next_check - checked_at = ?').get(day)?.count, 11);
 });
 
 test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack failures', async t => {
