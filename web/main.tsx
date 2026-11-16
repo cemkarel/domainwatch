@@ -5,9 +5,11 @@ import './style.css';
 
 interface Target {
   id: string; hostname: string; domain: string; domain_status: string; domain_expiry: string | null;
-  tls_status: string; tls_expiry: string | null; checked_at: number | null;
+  tls_enabled: number; tls_status: string; tls_expiry: string | null; checked_at: number | null;
 }
 interface Settings { enabled: boolean; thresholds: number[]; url: string | null; webhookError: string | null }
+interface BulkResult { added: number; duplicates: number; invalid: string[] }
+type TargetSort = 'hostname' | 'domain_expiry' | 'tls_expiry';
 interface Alert {
   id: string; hostname: string; kind: 'tls' | 'domain'; threshold: number; state: string;
   attempts: number; last_result: string | null; updated_at: number;
@@ -183,13 +185,22 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const [settings, setSettings] = useState<Settings>();
   const [page, setPage] = useState<'targets' | 'settings' | 'alerts'>('targets');
   const [host, setHost] = useState('');
+  const [bulkHosts, setBulkHosts] = useState('');
+  const [bulkResult, setBulkResult] = useState<BulkResult>();
   const [search, setSearch] = useState('');
+  const [targetSort, setTargetSort] = useState<TargetSort>('hostname');
   const [url, setUrl] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice>();
   const query = search.trim().toLowerCase();
-  const visibleTargets = query ? targets.filter(target =>
+  const matchingTargets = query ? targets.filter(target =>
     target.hostname.toLowerCase().includes(query) || target.domain.toLowerCase().includes(query)) : targets;
+  const visibleTargets = targetSort === 'hostname' ? matchingTargets : [...matchingTargets].sort((a, b) => {
+    const aExpiry = Date.parse(a[targetSort] ?? '');
+    const bExpiry = Date.parse(b[targetSort] ?? '');
+    return (Number.isFinite(aExpiry) ? aExpiry : Infinity) - (Number.isFinite(bExpiry) ? bExpiry : Infinity) ||
+      a.hostname.localeCompare(b.hostname);
+  });
 
   function showError(error: unknown) {
     const code = errorCode(error);
@@ -201,7 +212,7 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const loadAlerts = async () => setAlerts(await api<Alert[]>('/alerts'));
   const loadSettings = async () => setSettings(await api<Settings>('/settings/slack'));
   const checksPending = page === 'targets' &&
-    targets.some(target => target.domain_status === 'pending' || target.tls_status === 'pending');
+    targets.some(target => target.domain_status === 'pending' || (target.tls_enabled && target.tls_status === 'pending'));
 
   useEffect(() => {
     const load = page === 'targets' ? loadTargets : page === 'settings' ? loadSettings : loadAlerts;
@@ -234,6 +245,24 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
       setHost('');
       await loadTargets();
       setNotice({ message: 'addedPending' });
+    });
+  }
+
+  function addBulk(event: FormEvent) {
+    event.preventDefault();
+    void run(async () => {
+      setBulkResult(undefined);
+      const result = await api<BulkResult>('/targets/bulk', 'POST', { hostnames: bulkHosts });
+      setBulkResult(result);
+      setBulkHosts(result.invalid.join('\n'));
+      if (result.added) await loadTargets();
+    });
+  }
+
+  function toggleTls(id: string, enabled: boolean) {
+    void run(async () => {
+      await api('/targets/' + id + '/tls', 'PUT', { enabled });
+      await loadTargets();
     });
   }
 
@@ -288,9 +317,34 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
           </label>
           <button className="button" disabled={busy}>{copy.add}</button>
         </form>
-        <label className="mt-5 block max-w-sm">{copy.searchTargets}
-          <input type="search" value={search} onChange={event => setSearch(event.target.value)} spellCheck={false} />
-        </label>
+        <details className="panel mt-3 p-5">
+          <summary className="cursor-pointer text-sm font-semibold">{copy.bulkAdd}</summary>
+          <form className="mt-4 space-y-3" onSubmit={addBulk}>
+            <label className="block">{copy.bulkDomains}
+              <textarea rows={5} value={bulkHosts} onChange={event => setBulkHosts(event.target.value)}
+                placeholder={'example.com\napp.example.net'} spellCheck={false} autoCapitalize="none"
+                aria-describedby="bulk-import-hint" disabled={busy} required />
+            </label>
+            <p className="muted text-sm" id="bulk-import-hint">{copy.bulkHint}</p>
+            <button className="button" disabled={busy || !bulkHosts.trim()}>{copy.bulkSubmit}</button>
+            {bulkResult && <p className="muted text-sm" role="status">
+              {copy.bulkSummary(bulkResult.added, bulkResult.duplicates)}
+              {bulkResult.invalid.length > 0 && <> {copy.bulkInvalid}</>}
+            </p>}
+          </form>
+        </details>
+        <div className="mt-5 flex flex-wrap items-end justify-between gap-3">
+          <label className="block w-full max-w-sm">{copy.searchTargets}
+            <input type="search" value={search} onChange={event => setSearch(event.target.value)} spellCheck={false} />
+          </label>
+          <label className="block">{copy.sortTargets}
+            <select className="quiet mt-2 block" value={targetSort} onChange={event => setTargetSort(event.target.value as TargetSort)}>
+              <option value="hostname">{copy.sortByHostname}</option>
+              <option value="domain_expiry">{copy.sortByDomainExpiry}</option>
+              <option value="tls_expiry">{copy.sortByTlsExpiry}</option>
+            </select>
+          </label>
+        </div>
         <section className="panel mt-3 overflow-x-auto" aria-label={copy.trackedAddresses}>
           {visibleTargets.length ? <table>
             <thead><tr><th>{copy.address}</th><th>{copy.domainExpiry}</th><th>{copy.tlsExpiry}</th><th>{copy.lastCheck}</th><th>{copy.actions}</th></tr></thead>
@@ -298,7 +352,13 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
               <td><strong>{target.hostname}</strong>{target.hostname !== target.domain && <div className="muted">{target.domain}</div>}</td>
               <td>{expiryView(target.domain_status, target.domain_expiry, copy,
                 target.domain.endsWith('.tr') ? formatDomainDate : formatDate)}</td>
-              <td>{expiryView(target.tls_status, target.tls_expiry, copy, formatDate)}</td>
+              <td><div className="flex items-center gap-3">
+                <input className="tls-switch" type="checkbox" role="switch" checked={Boolean(target.tls_enabled)}
+                  aria-label={copy.tlsToggle(target.hostname)} disabled={busy}
+                  onChange={event => toggleTls(target.id, event.target.checked)} />
+                {target.tls_enabled ? expiryView(target.tls_status, target.tls_expiry, copy, formatDate)
+                  : <span className="muted">{copy.tlsOff}</span>}
+              </div></td>
               <td className="muted">{target.checked_at ? formatDate(target.checked_at) : copy.statuses.pending}</td>
               <td><button className="quiet" disabled={busy} aria-label={copy.removeLabel(target.hostname)}
                 onClick={() => { if (confirm(copy.confirmRemoval(target.hostname))) void run(async () => {

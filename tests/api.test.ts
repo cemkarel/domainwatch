@@ -24,6 +24,9 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0008_retry_tls_dns_status.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0009_retry_pending_checks.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0010_retry_tls_with_certificate_api.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0011_retry_tr_whois.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0012_retry_io_rdap.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0013_optional_tls_checks.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -141,6 +144,28 @@ test('The watchlist accepts more than 400 addresses and rejects duplicates', asy
   assert.ok(targets.some(target => target.hostname === hostname));
 });
 
+test('Bulk import queues a pasted column, skips duplicates and returns invalid entries', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  const rows = Array.from({ length: 300 }, (_, index) => `site-${index}.example.com`);
+  const hostnames = [...rows, 'SITE-0.EXAMPLE.COM.', 'bad/url', 'example.org'].join('\r\n');
+  assert.equal((await f.request('/targets/bulk', 'POST', { hostnames })).status, 401);
+  assert.equal((await f.login()).status, 200);
+  f.seedLegacyTarget();
+  f.sql.prepare("INSERT INTO targets (id,user_id,hostname,domain) VALUES ('existing','shared','example.org','example.org')").run();
+
+  const imported = await f.request('/targets/bulk', 'POST', { hostnames });
+  assert.equal(imported.status, 200);
+  assert.deepEqual(await imported.json(), { added: 300, duplicates: 2, invalid: ['bad/url'] });
+  const queued = f.sql.prepare(`SELECT domain_status, tls_enabled, tls_status, next_check FROM targets
+    WHERE user_id='shared' AND hostname='site-299.example.com'`).get();
+  assert.deepEqual({ ...queued }, { domain_status: 'pending', tls_enabled: 0, tls_status: 'disabled', next_check: 0 });
+
+  const retried = await f.request('/targets/bulk', 'POST', { hostnames });
+  assert.deepEqual(await retried.json(), { added: 0, duplicates: 302, invalid: ['bad/url'] });
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS count FROM targets').get()?.count, 302);
+});
+
 test('The admin API tests unsaved Slack URLs and only returns decrypted settings to the admin', async t => {
   const f = fixture();
   t.after(() => f.sql.close());
@@ -183,7 +208,7 @@ test('The admin API tests unsaved Slack URLs and only returns decrypted settings
   assert.equal((await f.request('/settings/slack/test', 'POST')).status, 200);
 });
 
-test('Adding a target returns before TLS and publishes RDAP while the TLS check is still running', async t => {
+test('TLS is opt-in and enabling it publishes RDAP while the certificate check runs', async t => {
   const f = fixture();
   let releaseTls!: () => void;
   const tlsGate = new Promise<void>(resolve => { releaseTls = resolve; });
@@ -263,6 +288,13 @@ test('Adding a target returns before TLS and publishes RDAP while the TLS check 
   assert.equal(response.status, 201);
   const { id, checked } = await response.json() as { id: string; checked: boolean };
   assert.equal(checked, false);
+  await f.completeChecks();
+  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal(launch.mock.callCount(), 0);
+  const off = f.sql.prepare('SELECT domain_expiry,tls_enabled,tls_status FROM targets WHERE id=?').get(id);
+  assert.deepEqual({ ...off }, { domain_expiry: domainExpiry, tls_enabled: 0, tls_status: 'disabled' });
+
+  assert.equal((await f.request(`/targets/${id}/tls`, 'PUT', { enabled: true })).status, 200);
   await new Promise<void>(resolve => setImmediate(resolve));
   const partial = f.sql.prepare('SELECT domain_expiry,tls_status FROM targets WHERE id=?').get(id);
   assert.equal(partial?.domain_expiry, domainExpiry);
@@ -279,9 +311,14 @@ test('Adding a target returns before TLS and publishes RDAP while the TLS check 
   const alerts = f.sql.prepare('SELECT kind FROM alerts WHERE target_id=? ORDER BY kind').all(id);
   assert.deepEqual(alerts.map(alert => alert.kind), ['domain', 'tls']);
   assert.equal((await f.request('/targets', 'POST', { hostname: 'api.example.com' })).status, 409);
-  assert.equal(fetchMock.mock.callCount(), 5);
+  assert.equal(fetchMock.mock.callCount(), 7);
   assert.equal(launch.mock.callCount(), 1);
   assert.equal(close.mock.callCount(), 1);
+
+  assert.equal((await f.request(`/targets/${id}/tls`, 'PUT', { enabled: false })).status, 200);
+  assert.equal((await f.request(`/targets/${id}/tls`, 'PUT', { enabled: false })).status, 200);
+  const disabled = f.sql.prepare('SELECT tls_enabled,tls_status,tls_expiry FROM targets WHERE id=?').get(id);
+  assert.deepEqual({ ...disabled }, { tls_enabled: 0, tls_status: 'disabled', tls_expiry: null });
 });
 
 test('A configured workspace owner reuses legacy targets and encrypted Slack settings', async t => {
@@ -308,8 +345,8 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   assert.equal((await f.login()).status, 200);
   f.seedLegacyTarget();
   f.sql.prepare(`
-    INSERT INTO targets (id,user_id,hostname,domain,tls_status,next_check)
-    VALUES ('pending-id','shared','api.example.com','example.com','no_public_address',?)
+    INSERT INTO targets (id,user_id,hostname,domain,tls_enabled,tls_status,next_check)
+    VALUES ('pending-id','shared','api.example.com','example.com',1,'no_public_address',?)
   `).run(Date.now() + day);
   f.sql.exec(readFileSync(new URL('../migrations/0008_retry_tls_dns_status.sql', import.meta.url), 'utf8'));
   await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [7] });

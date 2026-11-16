@@ -8,6 +8,8 @@ import { sendSlack } from './network.ts';
 
 const app = new Hono<AdminApp>();
 const api = new Hono<AdminApp>();
+const limitBody = bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'body_too_large' }, 413) });
+const limitBulkBody = bodyLimit({ maxSize: 64 * 1024, onError: c => c.json({ error: 'bulk_body_too_large' }, 413) });
 app.use('*', async (c, next) => {
   await next();
   c.header('Cache-Control', 'no-store');
@@ -25,7 +27,7 @@ api.use('*', async (c, next) => {
   }
   await next();
 });
-api.use('*', bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'body_too_large' }, 413) }));
+api.use('*', (c, next) => (c.req.method === 'POST' && c.req.path === '/api/targets/bulk' ? limitBulkBody : limitBody)(c, next));
 api.post('/auth/login', login);
 api.use('*', requireAdmin);
 api.get('/auth/session', c => c.json({ ok: true }));
@@ -34,7 +36,7 @@ api.put('/auth/password', changePassword);
 
 api.get('/targets', async c => {
   const { results } = await c.env.DB.prepare(`
-    SELECT id, hostname, domain, domain_status, domain_expiry, tls_status, tls_expiry, checked_at
+    SELECT id, hostname, domain, domain_status, domain_expiry, tls_enabled, tls_status, tls_expiry, checked_at
     FROM targets WHERE user_id=? ORDER BY hostname
   `).bind(workspaceOwnerId(c.env)).all();
   return c.json(results);
@@ -47,8 +49,8 @@ api.post('/targets', async c => {
   const user = workspaceOwnerId(c.env);
   const id = crypto.randomUUID();
   const result = await c.env.DB.prepare(`
-    INSERT INTO targets(id,user_id,hostname,domain)
-    VALUES (?,?,?,?)
+    INSERT INTO targets(id,user_id,hostname,domain,tls_status)
+    VALUES (?,?,?,?,'disabled')
     ON CONFLICT(user_id,hostname) DO NOTHING
   `).bind(id, user, host.hostname, host.domain).run();
   if (!result.meta.changes) return c.json({ error: 'duplicate_hostname' }, 409);
@@ -56,6 +58,62 @@ api.post('/targets', async c => {
     console.error({ event: 'first_check_failed', targetId: id });
   }));
   return c.json({ id, checked: false }, 201);
+});
+
+api.post('/targets/bulk', async c => {
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.hostnames !== 'string') return c.json({ error: 'bulk_input_required' }, 400);
+  const entries = body.hostnames.split(/[\s,;]+/u).filter(Boolean);
+  if (!entries.length) return c.json({ error: 'bulk_input_required' }, 400);
+
+  const hosts = new Map<string, string>();
+  const invalid = new Set<string>();
+  let validCount = 0;
+  for (const entry of entries) {
+    const host = normalizeHost(entry);
+    if (!host) {
+      invalid.add(entry);
+      continue;
+    }
+    validCount++;
+    hosts.set(host.hostname, host.domain);
+  }
+
+  let added = 0;
+  if (hosts.size) {
+    const rows = Array.from(hosts, ([hostname, domain]) => ({ id: crypto.randomUUID(), hostname, domain }));
+    // SQLite needs a WHERE clause before ON CONFLICT in INSERT ... SELECT.
+    const result = await c.env.DB.prepare(`
+      INSERT INTO targets (id, user_id, hostname, domain, tls_status)
+      SELECT value->>'id', ?, value->>'hostname', value->>'domain', 'disabled'
+      FROM json_each(?) WHERE true
+      ON CONFLICT(user_id, hostname) DO NOTHING
+    `).bind(workspaceOwnerId(c.env), JSON.stringify(rows)).run();
+    added = result.meta.changes;
+  }
+  return c.json({ added, duplicates: validCount - added, invalid: [...invalid] });
+});
+
+api.put('/targets/:id/tls', async c => {
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.enabled !== 'boolean') return c.json({ error: 'invalid_tls_setting' }, 400);
+  const enabled = Number(body.enabled);
+  const id = c.req.param('id');
+  const user = workspaceOwnerId(c.env);
+  const result = await c.env.DB.prepare(`
+    UPDATE targets SET tls_enabled=?, tls_status=?, tls_expiry=NULL,
+      next_check=CASE WHEN ?=1 OR lease IS NOT NULL THEN 0 ELSE next_check END, lease=NULL
+    WHERE id=? AND user_id=? AND tls_enabled!=?
+  `).bind(enabled, enabled ? 'pending' : 'disabled', enabled, id, user, enabled).run();
+  if (!result.meta.changes) {
+    const target = await c.env.DB.prepare('SELECT id FROM targets WHERE id=? AND user_id=?').bind(id, user).first();
+    if (!target) return c.json({ error: 'not_found' }, 404);
+  } else if (enabled) {
+    c.executionCtx.waitUntil(checkNewTarget(c.env, id).catch(() => {
+      console.error({ event: 'first_check_failed', targetId: id });
+    }));
+  }
+  return c.json({ ok: true });
 });
 
 api.delete('/targets/:id', async c => {
