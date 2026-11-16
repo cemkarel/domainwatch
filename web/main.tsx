@@ -6,8 +6,9 @@ import './style.css';
 interface Target {
   id: string; hostname: string; domain: string; domain_status: string; domain_expiry: string | null;
   tls_enabled: number; tls_status: string; tls_expiry: string | null; checked_at: number | null;
+  tls_checked_at: number | null; check_pending: number;
 }
-interface TargetPage { targets: Target[]; hasNext: boolean; total: number; matched: number }
+interface TargetPage { targets: Target[]; totalPages: number; total: number; matched: number }
 interface Settings { enabled: boolean; thresholds: number[]; url: string | null; webhookError: string | null }
 interface BulkResult { added: number; duplicates: number; invalid: string[] }
 type TargetSort = 'hostname' | 'domain_expiry' | 'tls_expiry';
@@ -17,6 +18,7 @@ interface Alert {
 }
 
 const languageKey = 'domainwatch-language';
+const day = 86_400_000;
 
 type Notice = { message: 'addedPending' | 'slackSaved' | 'testSent' | 'passwordChanged' } | { error: string };
 
@@ -54,15 +56,18 @@ async function api<T>(path: string, method = 'GET', data?: unknown, signal?: Abo
   return await response.json() as T;
 }
 
-function expiryView(status: string, expiry: string | null, copy: Copy, formatDate: (value: string) => string) {
+function expiryView(status: string, expiry: string | null, now: number, copy: Copy, formatDate: (value: string) => string) {
   const statusText = label(copy.statuses, status) ?? status;
   if (!expiry) return <span className="muted">{statusText}</span>;
-  const days = Math.ceil((Date.parse(expiry) - Date.now()) / 86_400_000);
-  const expired = Date.parse(expiry) <= Date.now();
+  const remaining = Date.parse(expiry) - now;
+  if (!Number.isFinite(remaining)) return <span className="muted">{copy.dateUnavailable}</span>;
+  const days = Math.ceil(remaining / day);
+  const expired = remaining <= 0;
   return <div className="space-y-1">
     <div className="font-medium">{formatDate(expiry)}</div>
     <span className={'pill ' + (days <= 7 || status !== 'ok' ? 'warn' : '')}>
-      {expired ? copy.expired : copy.daysLeft(days)}
+      {status !== 'ok' && status !== 'tls_untrusted' && expired ? copy.lastKnownExpired
+        : expired ? copy.expired : copy.daysLeft(days)}
     </span>
     {status !== 'ok' && <div className="muted">{statusText}</div>}
   </div>;
@@ -181,8 +186,9 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     dateStyle: 'medium', timeZone: 'UTC'
   }), [copy.locale]);
   const formatDomainDate = (value: string) => domainDateFormat.format(new Date(value));
-  const [watchlist, setWatchlist] = useState<{ request: string; data?: TargetPage }>();
+  const [watchlist, setWatchlist] = useState<{ request: string; filter: string; data?: TargetPage }>();
   const [targetPage, setTargetPage] = useState(1);
+  const [now, setNow] = useState(Date.now);
   const [targetRefresh, setTargetRefresh] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [settings, setSettings] = useState<Settings>();
@@ -196,9 +202,12 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice>();
   const query = search.trim().toLowerCase();
-  const targetRequest = '/targets/page?' + new URLSearchParams({ page: String(targetPage), q: query, sort: targetSort });
+  const targetFilter = new URLSearchParams({ q: query, sort: targetSort }).toString();
+  const targetRequest = '/targets/page?page=' + targetPage + '&' + targetFilter;
   const currentWatchlist = watchlist?.request === targetRequest ? watchlist : undefined;
-  const visibleTargets = currentWatchlist?.data?.targets ?? [];
+  const targetData = currentWatchlist?.data;
+  const visibleTargets = targetData?.targets ?? [];
+  const totalPages = watchlist?.filter === targetFilter ? watchlist.data?.totalPages ?? 1 : 1;
   const refreshTargets = () => setTargetRefresh(current => current + 1);
 
   function showError(error: unknown) {
@@ -228,19 +237,18 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
       try {
         const data = await api<TargetPage>(targetRequest, 'GET', undefined, signal);
         if (signal.aborted) return;
-        if (!data.targets.length && targetPage > 1) {
-          setTargetPage(current => current === targetPage ? current - 1 : current);
+        if (targetPage > data.totalPages) {
+          setTargetPage(current => current === targetPage ? data.totalPages : current);
           return;
         }
-        setWatchlist({ request: targetRequest, data });
-        if (data.targets.some(target => target.domain_status === 'pending' ||
-          (target.tls_enabled && target.tls_status === 'pending'))) {
+        setWatchlist({ request: targetRequest, filter: targetFilter, data });
+        if (data.targets.some(target => target.check_pending)) {
           fastUntil ??= Date.now() + 25_000;
           if (Date.now() < fastUntil) delay = 2500;
         } else fastUntil = undefined;
       } catch (error) {
         if (signal.aborted) return;
-        setWatchlist(current => current?.request === targetRequest ? current : { request: targetRequest });
+        setWatchlist(current => current?.request === targetRequest ? current : { request: targetRequest, filter: targetFilter });
         showError(error);
       }
       timer = setTimeout(() => void load(), delay);
@@ -250,7 +258,31 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
       controller.abort();
       clearTimeout(timer);
     };
-  }, [page, query, targetPage, targetRefresh, targetRequest]);
+  }, [page, query, targetPage, targetRefresh, targetRequest, targetFilter]);
+
+  useEffect(() => {
+    if (page !== 'targets') return;
+    let timer: ReturnType<typeof setTimeout>;
+    function updateCountdowns() {
+      clearTimeout(timer);
+      const now = Date.now();
+      setNow(now);
+      let delay = 60_000;
+      for (const target of targetData?.targets ?? []) {
+        for (const expiry of [target.domain_expiry, target.tls_expiry]) {
+          const remaining = expiry ? Date.parse(expiry) - now : 0;
+          if (remaining > 0) delay = Math.min(delay, remaining % day || day);
+        }
+      }
+      timer = setTimeout(updateCountdowns, delay);
+    }
+    updateCountdowns();
+    document.addEventListener('visibilitychange', updateCountdowns);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', updateCountdowns);
+    };
+  }, [page, targetData]);
 
   async function run(action: () => Promise<void>) {
     if (busy) return;
@@ -283,6 +315,13 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   function toggleTls(id: string, enabled: boolean) {
     void run(async () => {
       await api('/targets/' + id + '/tls', 'PUT', { enabled });
+      refreshTargets();
+    });
+  }
+
+  function checkTarget(id: string) {
+    void run(async () => {
+      await api('/targets/' + id + '/check', 'POST');
       refreshTargets();
     });
   }
@@ -380,20 +419,29 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
             <thead><tr><th>{copy.address}</th><th>{copy.domainExpiry}</th><th>{copy.tlsExpiry}</th><th>{copy.lastCheck}</th><th>{copy.actions}</th></tr></thead>
             <tbody>{visibleTargets.map(target => <tr key={target.id}>
               <td><strong>{target.hostname}</strong>{target.hostname !== target.domain && <div className="muted">{target.domain}</div>}</td>
-              <td>{expiryView(target.domain_status, target.domain_expiry, copy,
+              <td>{expiryView(target.domain_status, target.domain_expiry, now, copy,
                 target.domain.endsWith('.tr') ? formatDomainDate : formatDate)}</td>
               <td><div className="flex items-center gap-3">
                 <input className="tls-switch" type="checkbox" role="switch" checked={Boolean(target.tls_enabled)}
                   aria-label={copy.tlsToggle(target.hostname)} disabled={busy}
                   onChange={event => toggleTls(target.id, event.target.checked)} />
-                {target.tls_enabled ? expiryView(target.tls_status, target.tls_expiry, copy, formatDate)
+                {target.tls_enabled ? expiryView(target.tls_status, target.tls_expiry, now, copy, formatDate)
                   : <span className="muted">{copy.tlsOff}</span>}
               </div></td>
-              <td className="muted">{target.checked_at ? formatDate(target.checked_at) : copy.statuses.pending}</td>
-              <td><button className="quiet" disabled={busy} aria-label={copy.removeLabel(target.hostname)}
-                onClick={() => { if (confirm(copy.confirmRemoval(target.hostname))) void run(async () => {
-                  await api('/targets/' + target.id, 'DELETE'); refreshTargets();
-                }); }}>{copy.remove}</button></td>
+              <td className="muted">
+                {target.checked_at ? formatDate(target.checked_at) : copy.statuses.pending}
+                {!!target.tls_enabled && target.tls_checked_at &&
+                  <div className="text-xs">TLS · {formatDate(target.tls_checked_at)}</div>}
+              </td>
+              <td><div className="flex flex-wrap gap-2">
+                <button className="quiet whitespace-nowrap" disabled={busy || !!target.check_pending}
+                  aria-label={target.check_pending ? undefined : copy.checkLabel(target.hostname)}
+                  onClick={() => checkTarget(target.id)}>{target.check_pending ? copy.checkPending : copy.checkNow}</button>
+                <button className="quiet" disabled={busy} aria-label={copy.removeLabel(target.hostname)}
+                  onClick={() => { if (confirm(copy.confirmRemoval(target.hostname))) void run(async () => {
+                    await api('/targets/' + target.id, 'DELETE'); refreshTargets();
+                  }); }}>{copy.remove}</button>
+              </div></td>
             </tr>)}</tbody>
           </table> : <p className="muted p-8" role="status">
             {!currentWatchlist ? copy.loadingTargets : !currentWatchlist.data ? copy.targetsUnavailable
@@ -405,14 +453,29 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
             {copy.totalTargets(currentWatchlist.data.total)}
             {query && <> · {copy.matchingTargets(currentWatchlist.data.matched)}</>}
           </p>}
-          {(targetPage > 1 || currentWatchlist?.data?.hasNext) && <nav className="ml-auto flex items-center gap-3"
+          {(targetPage > 1 || totalPages > 1) && <nav className="ml-auto flex flex-wrap items-center gap-2"
             aria-label={copy.targetPagination}>
+            <button className="quiet" disabled={busy || targetPage === 1} onClick={() => setTargetPage(1)}>
+              {copy.firstPage}
+            </button>
             <button className="quiet" disabled={busy || targetPage === 1} onClick={() => setTargetPage(current => current - 1)}>
               {copy.previousPage}
             </button>
-            <span className="muted text-sm" role="status">{copy.pageNumber(targetPage)}</span>
-            <button className="quiet" disabled={busy || !currentWatchlist?.data?.hasNext}
+            <form className="flex items-center gap-2" onSubmit={event => {
+              event.preventDefault();
+              const page = Number(new FormData(event.currentTarget).get('page'));
+              if (Number.isInteger(page) && page >= 1 && page <= totalPages) setTargetPage(page);
+            }}>
+              <input key={targetPage} className="page-input" type="number" name="page" min={1} max={totalPages}
+                required defaultValue={targetPage} aria-label={copy.pageInput} disabled={busy} />
+              <span className="muted text-sm whitespace-nowrap" role="status">{copy.pageNumber(targetPage, totalPages)}</span>
+              <button className="quiet" disabled={busy}>{copy.goToPage}</button>
+            </form>
+            <button className="quiet" disabled={busy || targetPage >= totalPages}
               onClick={() => setTargetPage(current => current + 1)}>{copy.nextPage}</button>
+            <button className="quiet" disabled={busy || targetPage >= totalPages} onClick={() => setTargetPage(totalPages)}>
+              {copy.lastPage}
+            </button>
           </nav>}
         </div>
       </>}

@@ -35,12 +35,6 @@ export function parseThresholds(input: unknown): number[] | null {
   return [...input].sort((a, b) => a - b);
 }
 
-export function dueThreshold(expiry: string, values: number[], now: number) {
-  const remaining = Date.parse(expiry) - now;
-  if (!Number.isFinite(remaining) || remaining <= 0) return undefined;
-  return values.filter(value => remaining <= value * day).sort((a, b) => a - b)[0];
-}
-
 const encoder = new TextEncoder();
 const base64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const bytes = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));

@@ -1,4 +1,4 @@
-import { day, decryptWebhook, dueThreshold } from './core.ts';
+import { day, decryptWebhook, thresholds } from './core.ts';
 import { checkDomain, rdapBootstrap, type Check } from './checks.ts';
 import { workspaceOwnerId, type Env } from './env.ts';
 import { sendSlack } from './network.ts';
@@ -9,9 +9,8 @@ interface Target {
   hostname: string;
   domain: string;
   tls_enabled: number;
-  enabled: number | null;
-  thresholds: string | null;
-  version: string | null;
+  next_check: number;
+  tls_next_check: number;
 }
 
 interface Alert {
@@ -24,10 +23,9 @@ interface Alert {
   user_id: string;
 }
 
-const targetQuery = `
-  SELECT t.id, t.hostname, t.domain, t.tls_enabled, n.enabled, n.thresholds, n.version
-  FROM targets t LEFT JOIN notifications n USING(user_id)
-`;
+const targetQuery = 'SELECT id, hostname, domain, tls_enabled, next_check, tls_next_check FROM targets';
+const warningWindow = Math.max(...thresholds) * day;
+const retryInterval = 60 * 60_000;
 
 const scheduledCheckLimit = 10;
 // Leave time for the last lookup and browser cleanup before the next minute.
@@ -45,65 +43,86 @@ async function settleWithin<T>(operation: Promise<T>, ms: number, fallback: T): 
 }
 
 async function checkTarget(
-  env: Env, target: Target, checkTls: ReturnType<typeof tlsChecks>['check'], loadBootstrap = rdapBootstrap
+  env: Env, target: Target, checkTls: ReturnType<typeof tlsChecks>['check'],
+  loadBootstrap = rdapBootstrap, dueAt = Date.now()
 ) {
   const now = Date.now();
+  const domainDue = target.next_check <= dueAt;
+  const tlsDue = target.tls_enabled === 1 && target.tls_next_check <= dueAt;
+  if (!domainDue && !tlsDue) return false;
   const lease = crypto.randomUUID();
-  const claim = await env.DB.prepare('UPDATE targets SET next_check=?, lease=? WHERE id=? AND next_check<=? AND tls_enabled=?')
-    .bind(now + 10 * 60_000, lease, target.id, now, target.tls_enabled).run();
+  const claim = await env.DB.prepare(`
+    UPDATE targets SET lease_until=?, lease=?
+    WHERE id=? AND lease_until<=? AND next_check=? AND tls_next_check=? AND tls_enabled=?
+  `).bind(now + 10 * 60_000, lease, target.id, now, target.next_check, target.tls_next_check, target.tls_enabled).run();
   if (!claim.meta.changes) return false;
 
-  const domainCheck = settleWithin<Check>(checkDomain(target.domain, loadBootstrap),
-    20_000, { status: 'rdap_error', expiry: null }).then(async result => {
-    await env.DB.prepare('UPDATE targets SET domain_status=?, domain_expiry=? WHERE id=? AND lease=?')
-      .bind(result.status, result.expiry, target.id, lease).run();
-    return result;
-  });
   const [domain, tls] = await Promise.all([
-    domainCheck,
-    target.tls_enabled ? settleWithin<Check>(checkTls(target.hostname), 22_000, { status: 'scanner_timeout', expiry: null })
-      : { status: 'disabled', expiry: null }
+    domainDue ? settleWithin<Check>(checkDomain(target.domain, loadBootstrap),
+      20_000, { status: 'rdap_error', expiry: null }) : undefined,
+    tlsDue ? settleWithin<Check>(checkTls(target.hostname), 22_000, { status: 'scanner_timeout', expiry: null })
+      : undefined
   ]);
   const checked = Date.now();
-  const statements = [
-    env.DB.prepare(`UPDATE targets SET tls_status=?, tls_expiry=?,
-      checked_at=?, next_check=?, lease=NULL WHERE id=? AND lease=?`)
-      .bind(tls.status, tls.expiry, checked, checked + day, target.id, lease)
-  ];
-
-  if (target.enabled && target.thresholds && target.version) {
-    const values = JSON.parse(target.thresholds) as number[];
-    for (const [kind, check] of [['domain', domain], ['tls', tls]] as const) {
-      if (!check.expiry) continue;
-      const threshold = dueThreshold(check.expiry, values, checked);
-      if (!threshold) continue;
-      const id = crypto.randomUUID();
-      statements.push(env.DB.prepare(`
-        INSERT INTO alerts (id,target_id,kind,expiry,threshold,settings_version,next_attempt,updated_at)
-        SELECT ?,t.id,?,?,?,?,?,? FROM targets t JOIN notifications n USING(user_id)
-        WHERE t.id=? AND t.checked_at=? AND n.enabled=1 AND n.version=?
-        ON CONFLICT(target_id,kind,expiry,threshold) DO UPDATE SET settings_version=excluded.settings_version,
-          state='pending', attempts=0, next_attempt=excluded.next_attempt, updated_at=excluded.updated_at,
-          last_result=NULL, claim=NULL
-        WHERE alerts.state!='sent' AND (alerts.settings_version!=excluded.settings_version
-          OR (alerts.kind='tls' AND alerts.last_result='superseded'))
-      `).bind(id, kind, check.expiry, threshold, target.version, checked, checked, target.id, checked, target.version));
-    }
+  const updates = ['lease=NULL', 'lease_until=0'];
+  const args: (number | string | null)[] = [];
+  if (domain) {
+    const temporary = ['rdap_error', 'whois_error', 'bootstrap_unavailable'].includes(domain.status);
+    const windowStarts = domain.expiry ? Date.parse(domain.expiry) - warningWindow : checked;
+    const nextCheck = temporary ? checked + retryInterval
+      : windowStarts <= checked ? checked + day : Math.min(checked + 7 * day, windowStarts);
+    updates.push('domain_status=?', temporary ? 'domain_expiry=COALESCE(?,domain_expiry)' : 'domain_expiry=?',
+      'checked_at=?', 'next_check=?');
+    args.push(domain.status, domain.expiry, checked, nextCheck);
+  }
+  if (tls) {
+    updates.push('tls_status=?', 'tls_expiry=?', 'tls_checked_at=?', 'tls_next_check=?');
+    args.push(tls.status, tls.expiry, checked, checked + day);
   }
 
-  const [updated] = await env.DB.batch(statements);
+  const updated = await env.DB.prepare(`UPDATE targets SET ${updates.join(', ')} WHERE id=? AND lease=?`)
+    .bind(...args, target.id, lease).run();
   if (!updated.meta.changes) return false;
-  console.log({ event: 'target_checked', targetId: target.id, domain: domain.status, tls: tls.status });
+  console.log({ event: 'target_checked', targetId: target.id, domain: domain?.status, tls: tls?.status });
   return true;
 }
 
-export async function checkNewTarget(env: Env, id: string) {
-  const target = await env.DB.prepare(targetQuery + ' WHERE t.id=? AND t.user_id=?')
+async function queueAlerts(env: Env, now: number, targetId?: string) {
+  const owner = workspaceOwnerId(env);
+  const enabled = await env.DB.prepare('SELECT 1 FROM notifications WHERE user_id=? AND enabled=1').bind(owner).first();
+  if (!enabled) return;
+  const from = new Date(now).toISOString();
+  const until = new Date(now + warningWindow).toISOString();
+  await env.DB.batch((['domain', 'tls'] as const).map(kind => {
+    const expiry = `t.${kind}_expiry`;
+    return env.DB.prepare(`
+      INSERT INTO alerts (id,target_id,kind,expiry,threshold,settings_version,next_attempt,updated_at)
+      SELECT lower(hex(randomblob(16))),id,?,expiry,threshold,version,?,?
+      FROM (
+        SELECT t.id, ${expiry} AS expiry, n.version,
+          (SELECT min(value) FROM json_each(n.thresholds)
+            WHERE round(unixepoch(${expiry},'subsec') * 1000) <= ? + value * ?) AS threshold
+        FROM targets t JOIN notifications n USING(user_id)
+        WHERE t.user_id=? AND n.enabled=1 AND ${expiry}>? AND ${expiry}<=?
+          ${kind === 'tls' ? 'AND t.tls_enabled=1' : ''}
+          ${targetId ? 'AND t.id=?' : ''}
+      ) WHERE threshold IS NOT NULL
+      ON CONFLICT(target_id,kind,expiry,threshold) DO UPDATE SET settings_version=excluded.settings_version,
+        state='pending', attempts=0, next_attempt=excluded.next_attempt, updated_at=excluded.updated_at,
+        last_result=NULL, claim=NULL
+      WHERE alerts.state!='sent' AND (alerts.settings_version!=excluded.settings_version
+        OR (alerts.kind='tls' AND alerts.last_result='superseded'))
+    `).bind(kind, now, now, now, day, owner, from, until, ...(targetId ? [targetId] : []));
+  }));
+}
+
+export async function checkTargetNow(env: Env, id: string) {
+  const target = await env.DB.prepare(targetQuery + ' WHERE id=? AND user_id=?')
     .bind(id, workspaceOwnerId(env)).first<Target>();
   if (!target) return false;
   const tls = tlsChecks(env.TLS_BROWSER, [target.hostname]);
   try {
-    return await checkTarget(env, target, tls.check);
+    if (await checkTarget(env, target, tls.check)) await queueAlerts(env, Date.now(), id);
   } finally {
     await settleWithin(tls.close(), 2000, undefined);
   }
@@ -111,15 +130,17 @@ export async function checkNewTarget(env: Env, id: string) {
 
 async function checks(env: Env, now: number) {
   const { results } = await env.DB.prepare(targetQuery + `
-    WHERE t.user_id=? AND t.next_check<=? ORDER BY t.next_check, t.id LIMIT ?
-  `).bind(workspaceOwnerId(env), now, scheduledCheckLimit).all<Target>();
+    WHERE user_id=? AND lease_until<=? AND (next_check<=? OR (tls_enabled=1 AND tls_next_check<=?))
+    ORDER BY CASE WHEN tls_enabled=1 THEN min(next_check,tls_next_check) ELSE next_check END, id LIMIT ?
+  `).bind(workspaceOwnerId(env), now, now, now, scheduledCheckLimit).all<Target>();
   let bootstrap: ReturnType<typeof rdapBootstrap> | undefined;
   const loadBootstrap = () => bootstrap ??= rdapBootstrap();
-  const tls = tlsChecks(env.TLS_BROWSER, results.filter(target => target.tls_enabled).map(target => target.hostname));
+  const tls = tlsChecks(env.TLS_BROWSER, results
+    .filter(target => target.tls_enabled && target.tls_next_check <= now).map(target => target.hostname));
   try {
     for (const target of results) {
       if (Date.now() - now >= scheduledCheckStartWindow) break;
-      await checkTarget(env, target, tls.check, loadBootstrap);
+      await checkTarget(env, target, tls.check, loadBootstrap, now);
     }
   } finally {
     await settleWithin(tls.close(), 2000, undefined);
@@ -139,11 +160,11 @@ async function deliveries(env: Env, now: number) {
     `).bind(now + 120_000, claim, alert.id, now).run();
     if (!result.meta.changes) continue;
     const current = await env.DB.prepare(`
-      SELECT n.encrypted_url FROM alerts a JOIN targets t ON t.id=a.target_id
+      SELECT n.encrypted_url, t.domain_status FROM alerts a JOIN targets t ON t.id=a.target_id
       JOIN notifications n USING(user_id)
       WHERE a.id=? AND a.claim=? AND n.enabled=1 AND n.version=a.settings_version
       AND a.expiry=(CASE WHEN a.kind='domain' THEN t.domain_expiry WHEN t.tls_enabled=1 THEN t.tls_expiry END)
-    `).bind(alert.id, claim).first<{ encrypted_url: string }>();
+    `).bind(alert.id, claim).first<{ encrypted_url: string; domain_status: string }>();
     let delivery: { ok: boolean; retry: boolean; result: string; delay?: number } =
       { ok: false, retry: false, result: 'superseded' };
     if (current && Date.parse(alert.expiry) > now && env.WEBHOOK_KEY) {
@@ -152,8 +173,10 @@ async function deliveries(env: Env, now: number) {
         const kind = alert.kind === 'tls' ? 'TLS certificate' : 'Domain registration';
         const expires = alert.kind === 'domain' && alert.hostname.endsWith('.tr')
           ? `expires on ${alert.expiry.slice(0, 10)}` : `expires at ${alert.expiry}`;
+        const stale = alert.kind === 'domain' && current.domain_status !== 'ok'
+          ? ' Based on the last verified expiry date.' : '';
         delivery = await sendSlack(url,
-          `DomainWatch · ${kind} for ${alert.hostname} ${expires} (${alert.threshold}-day alert).`);
+          `DomainWatch · ${kind} for ${alert.hostname} ${expires} (${alert.threshold}-day alert).${stale}`);
       } catch {
         delivery = { ok: false, retry: false, result: 'webhook_decryption_error' };
       }
@@ -169,7 +192,10 @@ async function deliveries(env: Env, now: number) {
 }
 
 export async function scheduled(env: Env) {
-  const now = Date.now();
-  const results = await Promise.allSettled([checks(env, now), deliveries(env, now)]);
-  if (results.some(result => result.status === 'rejected')) throw new Error('Scheduled job failed');
+  try {
+    await checks(env, Date.now());
+    await queueAlerts(env, Date.now());
+  } finally {
+    await deliveries(env, Date.now());
+  }
 }

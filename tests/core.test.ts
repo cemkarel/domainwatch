@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { day, decryptWebhook, dueThreshold, encryptWebhook, normalizeHost, parseThresholds, webhookUrl } from '../src/core.ts';
+import { decryptWebhook, encryptWebhook, normalizeHost, parseThresholds, webhookUrl } from '../src/core.ts';
 
 test('subdomains retain TLS hostname and use the registrable RDAP domain', () => {
   assert.deepEqual(normalizeHost('API.Example.CO.UK.'), { hostname: 'api.example.co.uk', domain: 'example.co.uk' });
@@ -20,17 +20,11 @@ test('Slack destinations use the exact public incoming webhook URL format', () =
   ]) assert.equal(webhookUrl(url), null);
 });
 
-test('thresholds select the closest applicable window', () => {
+test('notification settings normalize selected thresholds and reject duplicates and unsupported values', () => {
   const values = parseThresholds([30, 1, 14, 7, 3]);
   assert.deepEqual(values, [1, 3, 7, 14, 30]);
   assert.equal(parseThresholds([7, 7]), null);
   assert.equal(parseThresholds([6]), null);
-  const expiry = '2027-01-01T00:00:00.000Z';
-  const instant = Date.parse(expiry);
-  assert.equal(dueThreshold(expiry, values!, instant - 8 * day), 14);
-  assert.equal(dueThreshold(expiry, values!, instant - day), 1);
-  assert.equal(dueThreshold(expiry, values!, instant), undefined);
-  assert.equal(dueThreshold(expiry, values!, instant - 31 * day), undefined);
 });
 
 test('AES-GCM ciphertext is randomized and bound to its tenant', async () => {

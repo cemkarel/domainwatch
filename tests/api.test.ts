@@ -28,6 +28,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0012_retry_io_rdap.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0013_optional_tls_checks.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0014_watchlist_sort_indexes.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0015_check_schedules.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -166,9 +167,10 @@ test('Watchlist pagination searches and sorts the workspace before selecting a p
   async function watchlist(query = '') {
     const response = await f.request('/targets/page' + query);
     assert.equal(response.status, 200);
-    const { targets, hasNext, total, matched } = await response.json() as {
-      targets: { hostname: string }[]; hasNext: boolean; total: number; matched: number;
+    const { targets, hasNext, total, matched, totalPages } = await response.json() as {
+      targets: { hostname: string }[]; hasNext: boolean; total: number; matched: number; totalPages: number;
     };
+    assert.equal(totalPages, matched > 25 ? 2 : 1);
     return { hosts: targets.map(target => target.hostname), hasNext, total, matched };
   }
 
@@ -351,7 +353,7 @@ test('TLS is opt-in and enabling it publishes RDAP while the certificate check r
   const alerts = f.sql.prepare('SELECT kind FROM alerts WHERE target_id=? ORDER BY kind').all(id);
   assert.deepEqual(alerts.map(alert => alert.kind), ['domain', 'tls']);
   assert.equal((await f.request('/targets', 'POST', { hostname: 'api.example.com' })).status, 409);
-  assert.equal(fetchMock.mock.callCount(), 7);
+  assert.equal(fetchMock.mock.callCount(), 5);
   assert.equal(launch.mock.callCount(), 1);
   assert.equal(close.mock.callCount(), 1);
 
@@ -450,4 +452,77 @@ test('Cron obtains RDAP data, deduplicates alerts and retries temporary Slack fa
   assert.equal(slackRequests, 2);
   const history = await (await f.request('/alerts')).json() as { state: string }[];
   assert.deepEqual(history.map(alert => alert.state), ['sent']);
+});
+
+test('Registration checks use the weekly and daily windows, and a manual retry preserves the last date on failure', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-04-06T12:00:00Z') });
+  assert.equal((await f.request('/targets/missing/check', 'POST')).status, 401);
+  assert.equal((await f.login()).status, 200);
+  assert.equal((await f.request('/targets/missing/check', 'POST')).status, 404);
+  let expiry = new Date(Date.now() + 700 * day).toISOString();
+  let failed = false;
+  let lookups = 0;
+  t.mock.method(globalThis, 'fetch', async (url: string | URL) => {
+    if (url === 'https://data.iana.org/rdap/dns.json') {
+      return Response.json({ services: [[['dev'], ['https://rdap.example.com/']]] });
+    }
+    assert.equal(String(url), 'https://rdap.example.com/domain/test-domain.dev');
+    lookups++;
+    return failed ? new Response(null, { status: 503 })
+      : Response.json({ objectClassName: 'domain', events: [{ eventAction: 'expiration', eventDate: expiry }] });
+  });
+  const { id } = await (await f.request('/targets', 'POST', { hostname: 'test-domain.dev' })).json() as { id: string };
+  await f.completeChecks();
+  const row = () => f.sql.prepare('SELECT * FROM targets WHERE id=?').get(id)!;
+  assert.equal(row().next_check, Date.now() + 7 * day);
+
+  t.mock.timers.tick(day);
+  assert.equal((await f.request('/targets/page')).status, 200);
+  await scheduled(f.env);
+  assert.equal(lookups, 1);
+
+  expiry = new Date(Date.now() + 33 * day).toISOString();
+  assert.equal((await f.request(`/targets/${id}/check`, 'POST')).status, 202);
+  await f.completeChecks();
+  assert.equal(row().domain_expiry, expiry);
+  assert.equal(row().next_check, Date.now() + 3 * day);
+  t.mock.timers.tick(3 * day);
+  await scheduled(f.env);
+  assert.equal(lookups, 3);
+  assert.equal(row().next_check, Date.now() + day);
+
+  failed = true;
+  assert.equal((await f.request(`/targets/${id}/check`, 'POST')).status, 202);
+  await f.completeChecks();
+  assert.equal(lookups, 4);
+  assert.equal(row().domain_status, 'rdap_error');
+  assert.equal(row().domain_expiry, expiry);
+  assert.equal(row().next_check, Date.now() + 60 * 60_000);
+});
+
+test('Slack uses the closest applicable threshold from stored dates without a registry check', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-04-06T12:00:00Z') });
+  assert.equal((await f.login()).status, 200);
+  await f.request('/settings/slack', 'PUT', { url: webhook, enabled: true, thresholds: [30, 14, 7, 3, 1] });
+  const insert = f.sql.prepare(`
+    INSERT INTO targets (id,user_id,hostname,domain,domain_status,domain_expiry,next_check)
+    VALUES (?, 'shared', ?, ?, 'ok', ?, ?)
+  `);
+  for (const days of [-1, 0, 1, 8, 31]) {
+    const host = `site-${days}.example.com`;
+    insert.run(host, host, 'example.com', new Date(Date.now() + days * day).toISOString(), Date.now() + day);
+  }
+  const fetchMock = t.mock.method(globalThis, 'fetch', async (url: string) => {
+    assert.equal(url, webhook);
+    return new Response('ok');
+  });
+  await scheduled(f.env);
+  await scheduled(f.env);
+  const alerts = f.sql.prepare('SELECT threshold, state FROM alerts ORDER BY threshold').all();
+  assert.deepEqual(alerts.map(alert => [alert.threshold, alert.state]), [[1, 'sent'], [14, 'sent']]);
+  assert.equal(fetchMock.mock.callCount(), 2);
 });

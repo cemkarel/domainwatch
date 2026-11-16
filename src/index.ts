@@ -3,12 +3,13 @@ import { bodyLimit } from 'hono/body-limit';
 import { changePassword, login, logout, requireAdmin, type AdminApp } from './auth.ts';
 import { decryptWebhook, encryptWebhook, normalizeHost, parseThresholds, thresholds, webhookUrl } from './core.ts';
 import { workspaceOwnerId, type Env } from './env.ts';
-import { checkNewTarget, scheduled } from './jobs.ts';
+import { checkTargetNow, scheduled } from './jobs.ts';
 import { sendSlack } from './network.ts';
 
 const app = new Hono<AdminApp>();
 const api = new Hono<AdminApp>();
-const targetColumns = 'id, hostname, domain, domain_status, domain_expiry, tls_enabled, tls_status, tls_expiry, checked_at';
+const targetColumns = `id, hostname, domain, domain_status, domain_expiry, tls_enabled, tls_status, tls_expiry,
+  checked_at, tls_checked_at, (next_check=0 OR (tls_enabled=1 AND tls_next_check=0) OR lease_until>?) AS check_pending`;
 const targetPageSize = 25;
 const limitBody = bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'body_too_large' }, 413) });
 const limitBulkBody = bodyLimit({ maxSize: 64 * 1024, onError: c => c.json({ error: 'bulk_body_too_large' }, 413) });
@@ -40,7 +41,7 @@ api.get('/targets', async c => {
   const { results } = await c.env.DB.prepare(`
     SELECT ${targetColumns}
     FROM targets WHERE user_id=? ORDER BY hostname
-  `).bind(workspaceOwnerId(c.env)).all();
+  `).bind(Date.now(), workspaceOwnerId(c.env)).all();
   return c.json(results);
 });
 
@@ -60,15 +61,22 @@ api.get('/targets/page', async c => {
     c.env.DB.prepare(`
       SELECT ${targetColumns} FROM targets WHERE user_id=?${search ? ` AND ${matches}` : ''}
       ORDER BY ${order} LIMIT ? OFFSET ?
-    `).bind(user, ...searchParams, targetPageSize, offset),
+    `).bind(Date.now(), user, ...searchParams, targetPageSize, offset),
     c.env.DB.prepare(`
       SELECT COUNT(*) AS total, COUNT(*) ${search ? `FILTER (WHERE ${matches})` : ''} AS matched
       FROM targets WHERE user_id=?
     `).bind(...searchParams, user)
   ]);
   const { total, matched } = counts.results[0] as { total: number; matched: number };
-  return c.json({ targets: rows.results, hasNext: offset + rows.results.length < matched, total, matched });
+  return c.json({ targets: rows.results, hasNext: offset + rows.results.length < matched,
+    total, matched, totalPages: Math.max(1, Math.ceil(matched / targetPageSize)) });
 });
+
+function startTargetCheck(ctx: Pick<ExecutionContext, 'waitUntil'>, env: Env, id: string) {
+  ctx.waitUntil(checkTargetNow(env, id).catch(() => {
+    console.error({ event: 'target_check_failed', targetId: id });
+  }));
+}
 
 api.post('/targets', async c => {
   const body = await c.req.json().catch(() => null);
@@ -82,9 +90,7 @@ api.post('/targets', async c => {
     ON CONFLICT(user_id,hostname) DO NOTHING
   `).bind(id, user, host.hostname, host.domain).run();
   if (!result.meta.changes) return c.json({ error: 'duplicate_hostname' }, 409);
-  c.executionCtx.waitUntil(checkNewTarget(c.env, id).catch(() => {
-    console.error({ event: 'first_check_failed', targetId: id });
-  }));
+  startTargetCheck(c.executionCtx, c.env, id);
   return c.json({ id, checked: false }, 201);
 });
 
@@ -130,18 +136,26 @@ api.put('/targets/:id/tls', async c => {
   const user = workspaceOwnerId(c.env);
   const result = await c.env.DB.prepare(`
     UPDATE targets SET tls_enabled=?, tls_status=?, tls_expiry=NULL,
-      next_check=CASE WHEN ?=1 OR lease IS NOT NULL THEN 0 ELSE next_check END, lease=NULL
+      tls_next_check=0, tls_checked_at=NULL, lease=NULL, lease_until=0
     WHERE id=? AND user_id=? AND tls_enabled!=?
-  `).bind(enabled, enabled ? 'pending' : 'disabled', enabled, id, user, enabled).run();
+  `).bind(enabled, enabled ? 'pending' : 'disabled', id, user, enabled).run();
   if (!result.meta.changes) {
     const target = await c.env.DB.prepare('SELECT id FROM targets WHERE id=? AND user_id=?').bind(id, user).first();
     if (!target) return c.json({ error: 'not_found' }, 404);
   } else if (enabled) {
-    c.executionCtx.waitUntil(checkNewTarget(c.env, id).catch(() => {
-      console.error({ event: 'first_check_failed', targetId: id });
-    }));
+    startTargetCheck(c.executionCtx, c.env, id);
   }
   return c.json({ ok: true });
+});
+
+api.post('/targets/:id/check', async c => {
+  const id = c.req.param('id');
+  const result = await c.env.DB.prepare(`
+    UPDATE targets SET next_check=0, tls_next_check=0 WHERE id=? AND user_id=?
+  `).bind(id, workspaceOwnerId(c.env)).run();
+  if (!result.meta.changes) return c.json({ error: 'not_found' }, 404);
+  startTargetCheck(c.executionCtx, c.env, id);
+  return c.json({ ok: true }, 202);
 });
 
 api.delete('/targets/:id', async c => {
