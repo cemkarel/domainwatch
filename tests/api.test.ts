@@ -27,6 +27,7 @@ function fixture() {
   sql.exec(readFileSync(new URL('../migrations/0011_retry_tr_whois.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0012_retry_io_rdap.sql', import.meta.url), 'utf8'));
   sql.exec(readFileSync(new URL('../migrations/0013_optional_tls_checks.sql', import.meta.url), 'utf8'));
+  sql.exec(readFileSync(new URL('../migrations/0014_watchlist_sort_indexes.sql', import.meta.url), 'utf8'));
   function prepare(query: string, params: SQLInputValue[] = []) {
     return {
       bind: (...args: SQLInputValue[]) => prepare(query, args),
@@ -142,6 +143,36 @@ test('The watchlist accepts more than 400 addresses and rejects duplicates', asy
   const targets = await (await f.request('/targets')).json() as { hostname: string }[];
   assert.equal(targets.length, 401);
   assert.ok(targets.some(target => target.hostname === hostname));
+});
+
+test('Watchlist pagination searches and sorts the workspace before selecting a page', async t => {
+  const f = fixture();
+  t.after(() => f.sql.close());
+  assert.equal((await f.request('/targets/page')).status, 401);
+  assert.equal((await f.login()).status, 200);
+  f.seedLegacyTarget();
+  const insert = f.sql.prepare(`INSERT INTO targets (id,user_id,hostname,domain,domain_expiry,tls_expiry)
+    VALUES (?,'shared',?,?,?,?)`);
+  const hosts = Array.from({ length: 28 }, (_, index) => `site-${String(index).padStart(2, '0')}.example.com`);
+  for (const [index, hostname] of hosts.entries()) {
+    insert.run(hostname, hostname, 'example.com', index === 26 ? '2030-01-01T00:00:00.000Z' : null,
+      index === 27 ? '2031-01-01T00:00:00.000Z' : null);
+  }
+
+  async function watchlist(query = '') {
+    const response = await f.request('/targets/page' + query);
+    assert.equal(response.status, 200);
+    const { targets, hasNext } = await response.json() as { targets: { hostname: string }[]; hasNext: boolean };
+    return { hosts: targets.map(target => target.hostname), hasNext };
+  }
+
+  assert.deepEqual(await watchlist(), { hosts: hosts.slice(0, 25), hasNext: true });
+  assert.deepEqual(await watchlist('?page=2'), { hosts: hosts.slice(25), hasNext: false });
+  assert.deepEqual(await watchlist('?q=SITE-27'), { hosts: [hosts[27]], hasNext: false });
+  assert.deepEqual(await watchlist('?q=example.org'), { hosts: [], hasNext: false });
+  assert.deepEqual(await watchlist('?sort=domain_expiry'), { hosts: [hosts[26], ...hosts.slice(0, 24)], hasNext: true });
+  assert.deepEqual(await watchlist('?page=2&sort=tls_expiry&q=example.com'), { hosts: hosts.slice(24, 27), hasNext: false });
+  assert.equal((await f.request('/targets/page?page=-1')).status, 400);
 });
 
 test('Bulk import queues a pasted column, skips duplicates and returns invalid entries', async t => {

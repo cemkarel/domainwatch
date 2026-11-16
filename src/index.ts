@@ -8,6 +8,8 @@ import { sendSlack } from './network.ts';
 
 const app = new Hono<AdminApp>();
 const api = new Hono<AdminApp>();
+const targetColumns = 'id, hostname, domain, domain_status, domain_expiry, tls_enabled, tls_status, tls_expiry, checked_at';
+const targetPageSize = 25;
 const limitBody = bodyLimit({ maxSize: 4096, onError: c => c.json({ error: 'body_too_large' }, 413) });
 const limitBulkBody = bodyLimit({ maxSize: 64 * 1024, onError: c => c.json({ error: 'bulk_body_too_large' }, 413) });
 app.use('*', async (c, next) => {
@@ -36,10 +38,27 @@ api.put('/auth/password', changePassword);
 
 api.get('/targets', async c => {
   const { results } = await c.env.DB.prepare(`
-    SELECT id, hostname, domain, domain_status, domain_expiry, tls_enabled, tls_status, tls_expiry, checked_at
+    SELECT ${targetColumns}
     FROM targets WHERE user_id=? ORDER BY hostname
   `).bind(workspaceOwnerId(c.env)).all();
   return c.json(results);
+});
+
+api.get('/targets/page', async c => {
+  const page = c.req.query('page') ?? '1';
+  const offset = (Number(page) - 1) * targetPageSize;
+  if (!/^[1-9][0-9]*$/.test(page) || !Number.isSafeInteger(offset)) {
+    return c.json({ error: 'invalid_page' }, 400);
+  }
+  const search = c.req.query('q')?.trim().toLowerCase() ?? '';
+  const sort = c.req.query('sort');
+  const order = sort === 'domain_expiry' || sort === 'tls_expiry' ? `${sort} ASC NULLS LAST, hostname` : 'hostname';
+  const filter = search ? ' AND (instr(hostname, ?) > 0 OR instr(domain, ?) > 0)' : '';
+  const { results } = await c.env.DB.prepare(`
+    SELECT ${targetColumns} FROM targets WHERE user_id=?${filter}
+    ORDER BY ${order} LIMIT ? OFFSET ?
+  `).bind(workspaceOwnerId(c.env), ...(search ? [search, search] : []), targetPageSize + 1, offset).all();
+  return c.json({ targets: results.slice(0, targetPageSize), hasNext: results.length > targetPageSize });
 });
 
 api.post('/targets', async c => {

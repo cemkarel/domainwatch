@@ -7,6 +7,7 @@ interface Target {
   id: string; hostname: string; domain: string; domain_status: string; domain_expiry: string | null;
   tls_enabled: number; tls_status: string; tls_expiry: string | null; checked_at: number | null;
 }
+interface TargetPage { targets: Target[]; hasNext: boolean }
 interface Settings { enabled: boolean; thresholds: number[]; url: string | null; webhookError: string | null }
 interface BulkResult { added: number; duplicates: number; invalid: string[] }
 type TargetSort = 'hostname' | 'domain_expiry' | 'tls_expiry';
@@ -41,9 +42,9 @@ class ApiError extends Error {
   constructor(public code: string) { super(code); }
 }
 
-async function api<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
+async function api<T>(path: string, method = 'GET', data?: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch('/api' + path, {
-    method, headers: data === undefined ? {} : { 'Content-Type': 'application/json' },
+    method, signal, headers: data === undefined ? {} : { 'Content-Type': 'application/json' },
     body: data === undefined ? undefined : JSON.stringify(data)
   });
   if (!response.ok) {
@@ -180,7 +181,9 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     dateStyle: 'medium', timeZone: 'UTC'
   }), [copy.locale]);
   const formatDomainDate = (value: string) => domainDateFormat.format(new Date(value));
-  const [targets, setTargets] = useState<Target[]>([]);
+  const [watchlist, setWatchlist] = useState<{ request: string; data?: TargetPage }>();
+  const [targetPage, setTargetPage] = useState(1);
+  const [targetRefresh, setTargetRefresh] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [settings, setSettings] = useState<Settings>();
   const [page, setPage] = useState<'targets' | 'settings' | 'alerts'>('targets');
@@ -193,14 +196,10 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<Notice>();
   const query = search.trim().toLowerCase();
-  const matchingTargets = query ? targets.filter(target =>
-    target.hostname.toLowerCase().includes(query) || target.domain.toLowerCase().includes(query)) : targets;
-  const visibleTargets = targetSort === 'hostname' ? matchingTargets : [...matchingTargets].sort((a, b) => {
-    const aExpiry = Date.parse(a[targetSort] ?? '');
-    const bExpiry = Date.parse(b[targetSort] ?? '');
-    return (Number.isFinite(aExpiry) ? aExpiry : Infinity) - (Number.isFinite(bExpiry) ? bExpiry : Infinity) ||
-      a.hostname.localeCompare(b.hostname);
-  });
+  const targetRequest = '/targets/page?' + new URLSearchParams({ page: String(targetPage), q: query, sort: targetSort });
+  const currentWatchlist = watchlist?.request === targetRequest ? watchlist : undefined;
+  const visibleTargets = currentWatchlist?.data?.targets ?? [];
+  const refreshTargets = () => setTargetRefresh(current => current + 1);
 
   function showError(error: unknown) {
     const code = errorCode(error);
@@ -208,28 +207,50 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     else setNotice({ error: code });
   }
 
-  const loadTargets = async () => setTargets(await api<Target[]>('/targets'));
   const loadAlerts = async () => setAlerts(await api<Alert[]>('/alerts'));
   const loadSettings = async () => setSettings(await api<Settings>('/settings/slack'));
-  const checksPending = page === 'targets' &&
-    targets.some(target => target.domain_status === 'pending' || (target.tls_enabled && target.tls_status === 'pending'));
 
   useEffect(() => {
-    const load = page === 'targets' ? loadTargets : page === 'settings' ? loadSettings : loadAlerts;
+    if (page === 'targets') return;
+    const load = page === 'settings' ? loadSettings : loadAlerts;
     void load().catch(showError);
     const interval = page === 'settings' ? undefined : setInterval(() => void load().catch(showError), 30_000);
     return () => clearInterval(interval);
   }, [page]);
 
   useEffect(() => {
-    if (!checksPending) return;
-    const interval = setInterval(() => void loadTargets().catch(showError), 2500);
-    const stop = setTimeout(() => clearInterval(interval), 25_000);
+    if (page !== 'targets') return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    let fastUntil: number | undefined;
+    async function load() {
+      let delay = 30_000;
+      try {
+        const data = await api<TargetPage>(targetRequest, 'GET', undefined, signal);
+        if (signal.aborted) return;
+        if (!data.targets.length && targetPage > 1) {
+          setTargetPage(current => current === targetPage ? current - 1 : current);
+          return;
+        }
+        setWatchlist({ request: targetRequest, data });
+        if (data.targets.some(target => target.domain_status === 'pending' ||
+          (target.tls_enabled && target.tls_status === 'pending'))) {
+          fastUntil ??= Date.now() + 25_000;
+          if (Date.now() < fastUntil) delay = 2500;
+        } else fastUntil = undefined;
+      } catch (error) {
+        if (signal.aborted) return;
+        setWatchlist(current => current?.request === targetRequest ? current : { request: targetRequest });
+        showError(error);
+      }
+      timer = setTimeout(() => void load(), delay);
+    }
+    let timer = setTimeout(() => void load(), query ? 200 : 0);
     return () => {
-      clearInterval(interval);
-      clearTimeout(stop);
+      controller.abort();
+      clearTimeout(timer);
     };
-  }, [checksPending]);
+  }, [page, query, targetPage, targetRefresh, targetRequest]);
 
   async function run(action: () => Promise<void>) {
     if (busy) return;
@@ -243,7 +264,7 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
     void run(async () => {
       await api('/targets', 'POST', { hostname: host });
       setHost('');
-      await loadTargets();
+      refreshTargets();
       setNotice({ message: 'addedPending' });
     });
   }
@@ -255,14 +276,14 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
       const result = await api<BulkResult>('/targets/bulk', 'POST', { hostnames: bulkHosts });
       setBulkResult(result);
       setBulkHosts(result.invalid.join('\n'));
-      if (result.added) await loadTargets();
+      if (result.added) refreshTargets();
     });
   }
 
   function toggleTls(id: string, enabled: boolean) {
     void run(async () => {
       await api('/targets/' + id + '/tls', 'PUT', { enabled });
-      await loadTargets();
+      refreshTargets();
     });
   }
 
@@ -309,7 +330,10 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
       {page === 'targets' && <>
         <div className="mt-8 mb-6 flex flex-wrap items-end justify-between gap-4">
           <div><h1>{copy.targets}</h1><p className="muted mt-2">{copy.schedule}</p></div>
-          <button className="quiet" disabled={busy} onClick={() => void run(loadTargets)}>{copy.refresh}</button>
+          <button className="quiet" disabled={busy} onClick={() => {
+            setNotice(undefined);
+            refreshTargets();
+          }}>{copy.refresh}</button>
         </div>
         <form className="panel flex flex-wrap items-end gap-3 p-5" onSubmit={add}>
           <label className="min-w-52 flex-1">{copy.hostname}
@@ -335,17 +359,23 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
         </details>
         <div className="mt-5 flex flex-wrap items-end justify-between gap-3">
           <label className="block w-full max-w-sm">{copy.searchTargets}
-            <input type="search" value={search} onChange={event => setSearch(event.target.value)} spellCheck={false} />
+            <input type="search" value={search} onChange={event => {
+              setSearch(event.target.value);
+              setTargetPage(1);
+            }} spellCheck={false} />
           </label>
           <label className="block">{copy.sortTargets}
-            <select className="quiet mt-2 block" value={targetSort} onChange={event => setTargetSort(event.target.value as TargetSort)}>
+            <select className="quiet mt-2 block" value={targetSort} onChange={event => {
+              setTargetSort(event.target.value as TargetSort);
+              setTargetPage(1);
+            }}>
               <option value="hostname">{copy.sortByHostname}</option>
               <option value="domain_expiry">{copy.sortByDomainExpiry}</option>
               <option value="tls_expiry">{copy.sortByTlsExpiry}</option>
             </select>
           </label>
         </div>
-        <section className="panel mt-3 overflow-x-auto" aria-label={copy.trackedAddresses}>
+        <section className="panel mt-3 overflow-x-auto" aria-label={copy.trackedAddresses} aria-busy={!currentWatchlist}>
           {visibleTargets.length ? <table>
             <thead><tr><th>{copy.address}</th><th>{copy.domainExpiry}</th><th>{copy.tlsExpiry}</th><th>{copy.lastCheck}</th><th>{copy.actions}</th></tr></thead>
             <tbody>{visibleTargets.map(target => <tr key={target.id}>
@@ -362,11 +392,23 @@ function Dashboard({ copy, onSignOut }: { copy: Copy; onSignOut: (changed?: bool
               <td className="muted">{target.checked_at ? formatDate(target.checked_at) : copy.statuses.pending}</td>
               <td><button className="quiet" disabled={busy} aria-label={copy.removeLabel(target.hostname)}
                 onClick={() => { if (confirm(copy.confirmRemoval(target.hostname))) void run(async () => {
-                  await api('/targets/' + target.id, 'DELETE'); await loadTargets();
+                  await api('/targets/' + target.id, 'DELETE'); refreshTargets();
                 }); }}>{copy.remove}</button></td>
             </tr>)}</tbody>
-          </table> : <p className="muted p-8" role="status">{targets.length ? copy.noMatchingTargets : copy.emptyTargets}</p>}
+          </table> : <p className="muted p-8" role="status">
+            {!currentWatchlist ? copy.loadingTargets : !currentWatchlist.data ? copy.targetsUnavailable
+              : query ? copy.noMatchingTargets : copy.emptyTargets}
+          </p>}
         </section>
+        {(targetPage > 1 || currentWatchlist?.data?.hasNext) && <nav className="mt-3 flex items-center justify-end gap-3"
+          aria-label={copy.targetPagination}>
+          <button className="quiet" disabled={busy || targetPage === 1} onClick={() => setTargetPage(current => current - 1)}>
+            {copy.previousPage}
+          </button>
+          <span className="muted text-sm" role="status">{copy.pageNumber(targetPage)}</span>
+          <button className="quiet" disabled={busy || !currentWatchlist?.data?.hasNext}
+            onClick={() => setTargetPage(current => current + 1)}>{copy.nextPage}</button>
+        </nav>}
       </>}
       {page === 'settings' && <>
         <h1 className="mt-8">{copy.settings}</h1>
